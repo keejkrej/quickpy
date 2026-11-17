@@ -1,0 +1,33 @@
+# QuickPy repository ignore rules.
+#
+# Generated guest build output and the pinned MicroPython checkout are never
+# committed. Rebuild them with ./guest/build.sh.
+/guest/build/
+/guest/.cache/
+
+# Local binaries produced by `go build` / `go run` in the repository root.
+/quickpy-spike
+/quickpy-spike.exe
+
+# Logs, temporary output, and test/profiling artifacts.
+*.log
+*.tmp
+*.out
+*.test
+*.prof
+*.pprof
+
+# Coverage output.
+*.cover
+*.coverprofile
+coverage.out
+coverage.html
+
+# OS and editor noise.
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# NOTE: do not ignore *.wasm globally. The small synthetic fixtures under
+# internal/wasmguest/testdata/*.wasm are intentional, committed test inputs.

@@ -1,0 +1,2 @@
+# Synthetic host-adapter test fixtures are binary WebAssembly modules.
+*.wasm binary
