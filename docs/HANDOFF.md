@@ -260,9 +260,11 @@ Current M1 work:
   rebuilt byte-identically, the default and race suites passed, the
   real-artifact integration suite passed three repeat runs, and guest smoke
   passed 66/66. No blocking issues were reported.
-- The increment is being published as a single PR from `m1/public-sdk`.
-  PR pointer: _pending until the PR is created; the final handoff report records
-  the actual URL and merge result._
+- The increment is published as PR **#2**:
+  <https://github.com/keejkrej/quickpy/pull/2> (base `main`, head
+  `m1/public-sdk`). At the time of this amendment the PR is open and pending
+  merge; use `gh pr view 2 --json state,mergeCommit` to resolve the final merge
+  result.
 - It is **not a full M1 acceptance or release**. Do not describe M1 as merged or
   accepted until the PR is merged.
 
