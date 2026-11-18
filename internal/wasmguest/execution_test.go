@@ -2,9 +2,11 @@ package wasmguest
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func delayTool(delay time.Duration) ToolHandler {
@@ -478,6 +480,7 @@ func TestAsyncMaxResumes(t *testing.T) {
 
 func TestAsyncToolPanic(t *testing.T) {
 	rt := newTestRuntime(t, "async_serial.wasm")
+	var obs []Observation
 	res, err := rt.ExecuteWithTools(context.Background(), Request{
 		Source:   "panic",
 		Filename: "main.py",
@@ -489,12 +492,17 @@ func TestAsyncToolPanic(t *testing.T) {
 			"b": delayTool(10 * time.Millisecond),
 		},
 		MaxConcurrentToolCalls: 1,
+		Observer:               func(o Observation) { obs = append(obs, o) },
 	})
-	if err != nil {
-		t.Fatalf("ExecuteWithTools: %v", err)
+	if err == nil {
+		t.Fatal("expected host fault")
 	}
-	if res.Status != StatusCompleted {
-		t.Fatalf("status = %q", res.Status)
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindHostFault {
+		t.Fatalf("error = %v", err)
+	}
+	if res == nil || res.Status != StatusGuestFault {
+		t.Fatalf("result = %+v", res)
 	}
 	var found bool
 	for _, e := range res.CallLedger {
@@ -507,6 +515,16 @@ func TestAsyncToolPanic(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("ledger = %+v", res.CallLedger)
+	}
+	// The finished observation is emitted before the hard error is returned.
+	var finished bool
+	for _, o := range obs {
+		if o.Kind == ObservationTool && o.CallID == 1 && o.Phase == "finished" && o.Error == "handler_panic" {
+			finished = true
+		}
+	}
+	if !finished {
+		t.Fatalf("observations = %+v", obs)
 	}
 }
 
@@ -525,11 +543,15 @@ func TestAsyncToolResultTooLarge(t *testing.T) {
 		MaxConcurrentToolCalls: 1,
 		MaxToolResultBytes:     10,
 	})
-	if err != nil {
-		t.Fatalf("ExecuteWithTools: %v", err)
+	if err == nil {
+		t.Fatal("expected limit error")
 	}
-	if res.Status != StatusCompleted {
-		t.Fatalf("status = %q", res.Status)
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindLimitExceeded {
+		t.Fatalf("error = %v", err)
+	}
+	if res == nil || res.Status != StatusLimitExceeded {
+		t.Fatalf("result = %+v", res)
 	}
 	var found bool
 	for _, e := range res.CallLedger {
@@ -542,6 +564,206 @@ func TestAsyncToolResultTooLarge(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("ledger = %+v", res.CallLedger)
+	}
+}
+
+func TestAsyncToolInvalidResult(t *testing.T) {
+	rt := newTestRuntime(t, "async_serial.wasm")
+	res, err := rt.ExecuteWithTools(context.Background(), Request{
+		Source:   "invalid result",
+		Filename: "main.py",
+		Timeout:  2 * time.Second,
+		Tools: map[string]ToolHandler{
+			"a": func(ctx context.Context, call ToolCall) (any, error) {
+				return make(chan int), nil
+			},
+			"b": delayTool(10 * time.Millisecond),
+		},
+		MaxConcurrentToolCalls: 1,
+	})
+	if err == nil {
+		t.Fatal("expected protocol error")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindProtocolError {
+		t.Fatalf("error = %v", err)
+	}
+	if res == nil || res.Status != StatusProtocolError {
+		t.Fatalf("result = %+v", res)
+	}
+	var found bool
+	for _, e := range res.CallLedger {
+		if e.ID == 1 {
+			found = true
+			if e.Error != "invalid_result" {
+				t.Fatalf("ledger entry = %+v", e)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ledger = %+v", res.CallLedger)
+	}
+}
+
+func TestAsyncPendingCountExcludesDelivered(t *testing.T) {
+	rt := newTestRuntime(t, "async_pending_reuse.wasm")
+	res, err := rt.ExecuteWithTools(context.Background(), Request{
+		Source:   "pending reuse",
+		Filename: "main.py",
+		Timeout:  2 * time.Second,
+		Tools: map[string]ToolHandler{
+			"a": delayTool(10 * time.Millisecond),
+		},
+		MaxPendingCalls: 1,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteWithTools: %v", err)
+	}
+	if res.Status != StatusCompleted {
+		t.Fatalf("status = %q", res.Status)
+	}
+	if res.ToolCalls != 2 {
+		t.Fatalf("tool calls = %d", res.ToolCalls)
+	}
+	if len(res.CallLedger) != 2 {
+		t.Fatalf("ledger = %+v", res.CallLedger)
+	}
+	for _, e := range res.CallLedger {
+		if e.State != CallCompleted || !e.Delivered || !e.Completed {
+			t.Fatalf("ledger entry = %+v", e)
+		}
+	}
+}
+
+func TestOutputClippingBeforeStoreAndObserver(t *testing.T) {
+	rt := newTestRuntime(t, "output_deltas.wasm")
+	var obs []Observation
+	res, err := rt.ExecuteWithTools(context.Background(), Request{
+		Source:         "output deltas",
+		Filename:       "main.py",
+		Timeout:        2 * time.Second,
+		MaxOutputBytes: 6,
+		Tools: map[string]ToolHandler{
+			"a": delayTool(10 * time.Millisecond),
+			"b": delayTool(10 * time.Millisecond),
+		},
+		Observer: func(o Observation) { obs = append(obs, o) },
+	})
+	if err == nil {
+		t.Fatal("expected limit error")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindLimitExceeded {
+		t.Fatalf("error = %v", err)
+	}
+	if res == nil || res.Status != StatusLimitExceeded {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(res.Outputs) != 2 || res.Outputs[0].Text != "AAAA" || res.Outputs[1].Text != "BB" {
+		t.Fatalf("outputs = %+v", res.Outputs)
+	}
+	if !res.OutputTruncated {
+		t.Fatal("OutputTruncated = false")
+	}
+	var texts []string
+	for _, o := range obs {
+		if o.Kind == ObservationText {
+			texts = append(texts, o.Text)
+		}
+	}
+	if !reflect.DeepEqual(texts, []string{"AAAA", "BB"}) {
+		t.Fatalf("text observations = %v", texts)
+	}
+}
+
+func TestObserverToolTransitionsAndDeadline(t *testing.T) {
+	rt := newTestRuntime(t, "async_serial.wasm")
+	var obs []Observation
+	var deadlines []time.Time
+	res, err := rt.ExecuteWithTools(context.Background(), Request{
+		Source:                 "observer",
+		Filename:               "main.py",
+		Timeout:                2 * time.Second,
+		MaxConcurrentToolCalls: 1,
+		Tools: map[string]ToolHandler{
+			"a": func(ctx context.Context, call ToolCall) (any, error) {
+				deadlines = append(deadlines, call.Deadline)
+				return "A", nil
+			},
+			"b": func(ctx context.Context, call ToolCall) (any, error) {
+				deadlines = append(deadlines, call.Deadline)
+				return "B", nil
+			},
+		},
+		Observer: func(o Observation) { obs = append(obs, o) },
+	})
+	if err != nil {
+		t.Fatalf("ExecuteWithTools: %v", err)
+	}
+	if res.Status != StatusCompleted {
+		t.Fatalf("status = %q", res.Status)
+	}
+	var tools []string
+	for _, o := range obs {
+		if o.Kind == ObservationTool {
+			tools = append(tools, fmt.Sprintf("%s:%d:%s:%s", o.Phase, o.CallID, o.ToolName, o.Error))
+		}
+	}
+	want := []string{"started:1:a:", "finished:1:a:", "started:2:b:", "finished:2:b:"}
+	if !reflect.DeepEqual(tools, want) {
+		t.Fatalf("tool observations = %v", tools)
+	}
+	if len(deadlines) != 2 {
+		t.Fatalf("deadlines = %v", deadlines)
+	}
+	for _, d := range deadlines {
+		if d.IsZero() {
+			t.Fatal("deadline is zero")
+		}
+	}
+	if len(obs) == 0 || obs[len(obs)-1].Kind != ObservationText || obs[len(obs)-1].Text != "A\nB\n" {
+		t.Fatalf("last observation = %+v", obs)
+	}
+}
+
+func TestObserverPanicIsHostFault(t *testing.T) {
+	rt := newTestRuntime(t, "completed.wasm")
+	res, err := rt.Execute(context.Background(), Request{
+		Source:   "observer panic",
+		Filename: "main.py",
+		Observer: func(o Observation) { panic("observer boom") },
+	})
+	if err == nil {
+		t.Fatal("expected host fault")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindHostFault {
+		t.Fatalf("error = %v", err)
+	}
+	if res == nil || res.Status != StatusGuestFault {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(res.Outputs) != 1 || res.Outputs[0].Text != "hello from synthetic guest" {
+		t.Fatalf("outputs = %+v", res.Outputs)
+	}
+}
+
+func TestTruncateStringUTF8Safe(t *testing.T) {
+	// "é" is 2 bytes; a 3-byte cap must not split the second rune.
+	got := truncateString("aéé", 3)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncateString produced invalid UTF-8: %q", got)
+	}
+	if got != "aé" {
+		t.Fatalf("truncateString = %q, want %q", got, "aé")
+	}
+	// A cap smaller than the first rune yields an empty valid prefix.
+	if got := truncateString("é", 1); got != "" {
+		t.Fatalf("truncateString = %q, want empty", got)
+	}
+	// Short strings are returned unchanged.
+	if got := truncateString("abc", 10); got != "abc" {
+		t.Fatalf("truncateString = %q", got)
 	}
 }
 

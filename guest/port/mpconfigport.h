@@ -49,16 +49,23 @@
 #define MICROPY_PY_TIME_GMTIME_LOCALTIME_MKTIME (0)
 #define MICROPY_PY_TIME_TIME_TIME_NS (0)
 
-// 32-bit floats keep the artifact smaller while still allowing ordinary
-// numeric Python code.  This is a spike choice, not a final decision.
-#define MICROPY_FLOAT_IMPL (MICROPY_FLOAT_IMPL_FLOAT)
+// M1 state and tool values are IEEE float64 on the wire.  Use double
+// precision so values that single precision cannot distinguish survive the
+// guest round trip.
+#define MICROPY_FLOAT_IMPL (MICROPY_FLOAT_IMPL_DOUBLE)
+
+// M1 state values are int64 on the wire.  wasm32 small ints are 31-bit, so
+// enable the 64-bit long-int representation for values outside that range.
+#define MICROPY_LONGINT_IMPL (MICROPY_LONGINT_IMPL_LONGLONG)
 
 #define MICROPY_ALLOC_PATH_MAX (256)
 #define MICROPY_ALLOC_PARSE_CHUNK_INIT (16)
 
 // Heap is allocated from wasi-libc malloc on first qp_invoke.  Each WASM
-// instance gets its own copy because linear memory is per-instance.
-#define MICROPY_HEAP_SIZE (1024 * 1024)
+// instance gets its own copy because linear memory is per-instance.  M1
+// raises this from 1 MiB to 4 MiB so a 1 MiB state value plus its validated
+// snapshot fit without turning ordinary state writes into MemoryError.
+#define MICROPY_HEAP_SIZE (4 * 1024 * 1024)
 
 typedef long mp_off_t;
 

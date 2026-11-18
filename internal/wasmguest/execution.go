@@ -8,6 +8,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -23,6 +24,9 @@ type ToolCall struct {
 	Args        map[string]any
 	ExecutionID string
 	CallID      int64
+	// Deadline is the execution deadline, or the zero time when the execution
+	// has no deadline.
+	Deadline time.Time
 }
 
 // ToolError is a structured, guest-safe tool failure.
@@ -75,9 +79,10 @@ type callState struct {
 }
 
 type toolResult struct {
-	id    int64
-	value any
-	err   error
+	id       int64
+	value    any
+	err      error
+	panicked bool
 }
 
 type toolResponse struct {
@@ -123,6 +128,9 @@ type executionOwner struct {
 	maxPendingCalls    int
 	maxResumes         int
 	maxToolResultBytes int
+	maxOutputBytes     int
+	maxStateBytes      int
+	initialState       json.RawMessage
 
 	calls           map[int64]*callState
 	tombstones      map[int64]bool
@@ -136,6 +144,8 @@ type executionOwner struct {
 	toolCalls       int
 	active          int
 	totalOutput     int
+	outputLimitHit  bool
+	observerFailed  bool
 	resultCh        chan toolResult
 	trace           []string
 }
@@ -176,11 +186,43 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 		return nil, newError(KindInvalidRequest, "", "execute", "", fmt.Sprintf("source exceeds %d bytes", r.opts.MaxMessageBytes), nil)
 	}
 
+	maxOutputBytes := req.MaxOutputBytes
+	if maxOutputBytes <= 0 {
+		maxOutputBytes = r.opts.MaxOutputBytes
+	}
+	maxStateBytes := req.MaxStateBytes
+	if maxStateBytes <= 0 {
+		maxStateBytes = r.opts.MaxStateBytes
+	}
+	if maxStateBytes <= 0 {
+		maxStateBytes = r.opts.MaxMessageBytes
+	}
+	maxConcurrent := req.MaxConcurrentToolCalls
+	if maxConcurrent <= 0 {
+		maxConcurrent = 8
+	}
+	maxToolCalls := req.MaxToolCalls
+	if maxToolCalls <= 0 {
+		maxToolCalls = 1000
+	}
+	maxPendingCalls := req.MaxPendingCalls
+	if maxPendingCalls <= 0 {
+		maxPendingCalls = 64
+	}
+	maxResumes := req.MaxResumes
+	if maxResumes <= 0 {
+		maxResumes = 10000
+	}
+	maxToolResultBytes := req.MaxToolResultBytes
+	if maxToolResultBytes <= 0 {
+		maxToolResultBytes = 1 << 20
+	}
+
 	execID := fmt.Sprintf("exec-%d", r.nextExec.Add(1))
 	instID := fmt.Sprintf("inst-%d", r.nextInst.Add(1))
 	start := time.Now()
-	stdout := newBoundedBuffer(r.opts.MaxOutputBytes)
-	stderr := newBoundedBuffer(r.opts.MaxOutputBytes)
+	stdout := newBoundedBuffer(maxOutputBytes)
+	stderr := newBoundedBuffer(maxOutputBytes)
 
 	result = &Result{
 		ExecutionID: execID,
@@ -214,6 +256,11 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 		}
 	}()
 
+	initialState, ierr := encodeInitialState(req.InitialState, maxStateBytes, execID)
+	if ierr != nil {
+		return result, ierr
+	}
+
 	timeout := req.Timeout
 	if timeout == 0 {
 		timeout = r.opts.DefaultTimeout
@@ -234,12 +281,12 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 		WithStderr(stderr).
 		WithStdin(strings.NewReader(""))
 
-	inst, ierr := r.rt.InstantiateModule(callCtx, r.compiled, modCfg)
-	if ierr != nil {
+	inst, instErr := r.rt.InstantiateModule(callCtx, r.compiled, modCfg)
+	if instErr != nil {
 		if cause := context.Cause(callCtx); cause != nil {
 			return result, classifyCause(cause, execID)
 		}
-		return result, newError(KindGuestFault, StatusGuestFault, "instantiate", execID, "instantiate failed: "+ierr.Error(), ierr)
+		return result, newError(KindGuestFault, StatusGuestFault, "instantiate", execID, "instantiate failed: "+instErr.Error(), instErr)
 	}
 	defer func() { _ = inst.Close(context.Background()) }()
 
@@ -267,8 +314,8 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 	}
 	version := uint32(abiRes[0])
 	result.Guest.ABIVersion = version
-	if version != 1 {
-		return result, protocolErr(execID, fmt.Sprintf("unsupported ABI version %d (want 1 = 0.1)", version))
+	if version != 2 {
+		return result, protocolErr(execID, fmt.Sprintf("unsupported ABI version %d (want 2 = 0.2)", version))
 	}
 
 	mem := inst.Memory()
@@ -282,27 +329,6 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 	invokeFn := inst.ExportedFunction("qp_invoke")
 	if allocFn == nil || freeFn == nil || invokeFn == nil {
 		return result, protocolErr(execID, "missing qp_alloc, qp_free, or qp_invoke export")
-	}
-
-	maxConcurrent := req.MaxConcurrentToolCalls
-	if maxConcurrent <= 0 {
-		maxConcurrent = 8
-	}
-	maxToolCalls := req.MaxToolCalls
-	if maxToolCalls <= 0 {
-		maxToolCalls = 1000
-	}
-	maxPendingCalls := req.MaxPendingCalls
-	if maxPendingCalls <= 0 {
-		maxPendingCalls = 64
-	}
-	maxResumes := req.MaxResumes
-	if maxResumes <= 0 {
-		maxResumes = 10000
-	}
-	maxToolResultBytes := req.MaxToolResultBytes
-	if maxToolResultBytes <= 0 {
-		maxToolResultBytes = 1 << 20
 	}
 
 	tools := make(map[string]ToolHandler, len(req.Tools))
@@ -328,6 +354,9 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 		maxPendingCalls:    maxPendingCalls,
 		maxResumes:         maxResumes,
 		maxToolResultBytes: maxToolResultBytes,
+		maxOutputBytes:     maxOutputBytes,
+		maxStateBytes:      maxStateBytes,
+		initialState:       initialState,
 		calls:              map[int64]*callState{},
 		tombstones:         map[int64]bool{},
 		awaiting:           map[int64]bool{},
@@ -335,10 +364,11 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 	}
 
 	resp, oerr := owner.invoke(startMessage{
-		V:        0,
-		Type:     "start",
-		Source:   req.Source,
-		Filename: req.Filename,
+		V:            0,
+		Type:         "start",
+		Source:       req.Source,
+		Filename:     req.Filename,
+		InitialState: initialState,
 	})
 	if oerr != nil {
 		owner.cancelAll()
@@ -354,10 +384,13 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 		switch resp.Type {
 		case "completed":
 			owner.finishAll()
-			result.Status = StatusCompleted
 			if ierr := owner.checkOutputLimits(); ierr != nil {
 				return result, ierr
 			}
+			if ierr := owner.commitState(resp); ierr != nil {
+				return result, ierr
+			}
+			result.Status = StatusCompleted
 			return result, nil
 
 		case "failed":
@@ -391,7 +424,10 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 					UnknownFields: resp.UnknownFields,
 				}
 			}
-			owner.dispatchQueued()
+			if derr := owner.dispatchQueued(); derr != nil {
+				owner.cancelAll()
+				return result, derr
+			}
 
 			if resp.Reason == "runnable" {
 				owner.resumeCount++
@@ -442,6 +478,23 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 			return result, protocolErr(execID, fmt.Sprintf("unexpected response type %q", resp.Type))
 		}
 	}
+}
+
+// encodeInitialState validates and encodes the initial state strictly. Nil is
+// encoded as JSON null (Python None). The returned error is InvalidRequest for
+// an unsupported value and LimitExceeded for an oversized encoding.
+func encodeInitialState(initial any, maxStateBytes int, execID string) (json.RawMessage, *Error) {
+	if initial == nil {
+		return json.RawMessage("null"), nil
+	}
+	b, err := encodeValue(initial)
+	if err != nil {
+		return nil, newError(KindInvalidRequest, "", "execute", execID, "invalid initial state: "+err.Error(), err)
+	}
+	if len(b) > maxStateBytes {
+		return nil, newError(KindLimitExceeded, StatusLimitExceeded, "execute", execID, fmt.Sprintf("initial state exceeds %d bytes", maxStateBytes), nil)
+	}
+	return json.RawMessage(b), nil
 }
 
 func (o *executionOwner) invoke(msg any) (*Response, *Error) {
@@ -514,7 +567,7 @@ func (o *executionOwner) invoke(msg any) (*Response, *Error) {
 		return nil, newError(KindGuestFault, StatusGuestFault, "free", o.result.ExecutionID, "qp_free(input) failed: "+ferr.Error(), ferr)
 	}
 
-	resp, derr := decodeResponse(respCopy, o.rt.opts.MaxOutputBytes)
+	resp, derr := decodeResponse(respCopy)
 	if derr != nil {
 		derr.ExecutionID = o.result.ExecutionID
 		return nil, derr
@@ -537,13 +590,38 @@ func (o *executionOwner) freeGuest(ptr, length uint32) error {
 	return err
 }
 
+// accumulateOutput stores and observes output deltas. It clips each delta to
+// the remaining cumulative cap before storing or observing it, so the retained
+// result prefix and the observer stream never exceed the resolved cap. The
+// first clipped delta makes the execution fail deterministically with
+// LimitExceeded; the retained prefix stays available on the result.
 func (o *executionOwner) accumulateOutput(resp *Response) *Error {
 	for _, out := range resp.Outputs {
 		if out.Type == "text" && out.Text == "" {
 			continue
 		}
-		o.result.Outputs = append(o.result.Outputs, out)
-		o.totalOutput += len(out.Text)
+		text := out.Text
+		if o.totalOutput >= o.maxOutputBytes {
+			o.result.OutputTruncated = true
+			o.outputLimitHit = true
+			continue
+		}
+		remaining := o.maxOutputBytes - o.totalOutput
+		if len(text) > remaining {
+			text = clipUTF8(text, remaining)
+			o.result.OutputTruncated = true
+			o.outputLimitHit = true
+		}
+		if text == "" && out.Text != "" {
+			continue
+		}
+		stored := out
+		stored.Text = text
+		o.result.Outputs = append(o.result.Outputs, stored)
+		o.totalOutput += len(text)
+		if err := o.emitOutput(stored); err != nil {
+			return err
+		}
 	}
 	o.result.UnknownFields = append(o.result.UnknownFields, resp.UnknownFields...)
 	if resp.OutputTruncated {
@@ -552,8 +630,8 @@ func (o *executionOwner) accumulateOutput(resp *Response) *Error {
 	if resp.Stalled {
 		o.result.Stalled = true
 	}
-	if o.totalOutput > o.rt.opts.MaxOutputBytes {
-		return newError(KindLimitExceeded, StatusLimitExceeded, "output", o.result.ExecutionID, fmt.Sprintf("total output exceeds %d bytes", o.rt.opts.MaxOutputBytes), nil)
+	if o.outputLimitHit {
+		return newError(KindLimitExceeded, StatusLimitExceeded, "output", o.result.ExecutionID, fmt.Sprintf("total output exceeds %d bytes", o.maxOutputBytes), nil)
 	}
 	return nil
 }
@@ -563,8 +641,30 @@ func (o *executionOwner) checkOutputLimits() *Error {
 		return newError(KindLimitExceeded, StatusLimitExceeded, "output", o.result.ExecutionID, "guest reported truncated output", nil)
 	}
 	if o.stdout.Truncated() || o.stderr.Truncated() {
-		return newError(KindLimitExceeded, StatusLimitExceeded, "output", o.result.ExecutionID, fmt.Sprintf("captured output exceeded %d bytes", o.rt.opts.MaxOutputBytes), nil)
+		return newError(KindLimitExceeded, StatusLimitExceeded, "output", o.result.ExecutionID, fmt.Sprintf("captured output exceeded %d bytes", o.maxOutputBytes), nil)
 	}
+	return nil
+}
+
+// commitState decodes and commits the final state of a completed response. It
+// is only called on the completed path; failed, suspended, stalled, cancelled,
+// and limited executions never commit state.
+func (o *executionOwner) commitState(resp *Response) *Error {
+	if !resp.StateWritten {
+		return nil
+	}
+	if !resp.StatePresent {
+		return protocolErr(o.result.ExecutionID, "completed response with state_written:true is missing state")
+	}
+	if len(resp.StateRaw) > o.maxStateBytes {
+		return newError(KindLimitExceeded, StatusLimitExceeded, "state", o.result.ExecutionID, fmt.Sprintf("state exceeds %d bytes", o.maxStateBytes), nil)
+	}
+	val, err := decodeValue(resp.StateRaw)
+	if err != nil {
+		return newError(KindProtocolError, StatusProtocolError, "state", o.result.ExecutionID, "invalid final state: "+err.Error(), err)
+	}
+	o.result.State = val
+	o.result.StateWritten = true
 	return nil
 }
 
@@ -617,7 +717,7 @@ func (o *executionOwner) validateSuspension(resp *Response) *Error {
 		if o.maxToolCalls > 0 && o.toolCalls >= o.maxToolCalls {
 			return newError(KindLimitExceeded, StatusLimitExceeded, "tool", o.result.ExecutionID, fmt.Sprintf("tool call count exceeds %d", o.maxToolCalls), nil)
 		}
-		if len(o.calls) >= o.maxPendingCalls {
+		if o.pendingCount() >= o.maxPendingCalls {
 			return newError(KindLimitExceeded, StatusLimitExceeded, "tool", o.result.ExecutionID, fmt.Sprintf("pending call count exceeds %d", o.maxPendingCalls), nil)
 		}
 		c := &callState{id: call.ID, name: call.Name, args: call.Args, state: CallReceived}
@@ -660,7 +760,21 @@ func (o *executionOwner) validateSuspension(resp *Response) *Error {
 	return nil
 }
 
-func (o *executionOwner) dispatchQueued() {
+// pendingCount counts calls that have not been delivered to the guest. It
+// excludes delivered and completed calls so the pending-call cap measures
+// actual outstanding work rather than the lifetime call count. Duplicate-ID
+// guards and tombstones remain in force.
+func (o *executionOwner) pendingCount() int {
+	n := 0
+	for _, c := range o.calls {
+		if c.state != CallDelivered && c.state != CallCompleted {
+			n++
+		}
+	}
+	return n
+}
+
+func (o *executionOwner) dispatchQueued() *Error {
 	for _, id := range o.receivedOrder {
 		c := o.calls[id]
 		if c == nil || c.state != CallReceived {
@@ -683,6 +797,9 @@ func (o *executionOwner) dispatchQueued() {
 				},
 			}
 			o.completionOrder = append(o.completionOrder, c.id)
+			if err := o.emitTool(c, "finished", "tool_not_found"); err != nil {
+				return err
+			}
 			continue
 		}
 		c.state = CallDispatched
@@ -690,16 +807,21 @@ func (o *executionOwner) dispatchQueued() {
 		c.ctx, c.cancel = context.WithCancel(o.callCtx)
 		o.dispatchOrder = append(o.dispatchOrder, c.id)
 		o.active++
+		if err := o.emitTool(c, "started", ""); err != nil {
+			return err
+		}
 		o.startHandler(c, handler)
 	}
+	return nil
 }
 
 func (o *executionOwner) startHandler(c *callState, handler ToolHandler) {
+	deadline, _ := o.callCtx.Deadline()
 	go func() {
 		var res toolResult
 		defer func() {
 			if p := recover(); p != nil {
-				res = toolResult{id: c.id, err: &ToolError{Code: "handler_panic", Message: fmt.Sprintf("tool handler panic: %v", p)}}
+				res = toolResult{id: c.id, err: fmt.Errorf("tool handler panic: %v", p), panicked: true}
 			}
 			o.resultCh <- res
 		}()
@@ -708,6 +830,7 @@ func (o *executionOwner) startHandler(c *callState, handler ToolHandler) {
 			Args:        c.args,
 			ExecutionID: o.result.ExecutionID,
 			CallID:      c.id,
+			Deadline:    deadline,
 		})
 		res = toolResult{id: c.id, value: value, err: err}
 	}()
@@ -726,25 +849,56 @@ func (o *executionOwner) processResult(tr toolResult) *Error {
 	c.completed = true
 	o.completionOrder = append(o.completionOrder, c.id)
 
+	if tr.panicked {
+		c.errorCode = "handler_panic"
+		if err := o.emitTool(c, "finished", "handler_panic"); err != nil {
+			return err
+		}
+		return newError(KindHostFault, StatusGuestFault, "tool", o.result.ExecutionID, fmt.Sprintf("tool handler panic: %v", tr.err), tr.err)
+	}
+
 	if tr.err != nil {
+		if errors.Is(tr.err, context.Canceled) || errors.Is(tr.err, context.DeadlineExceeded) {
+			if cause := context.Cause(o.callCtx); cause != nil {
+				code := "cancelled"
+				if errors.Is(cause, context.DeadlineExceeded) {
+					code = "deadline_exceeded"
+				}
+				c.errorCode = code
+				if err := o.emitTool(c, "finished", code); err != nil {
+					return err
+				}
+				return classifyToolCause(cause, o.result.ExecutionID)
+			}
+		}
 		code, msg := toolErrorCode(tr.err)
 		c.errorCode = code
 		c.response = &toolResponse{ID: c.id, OK: false, Error: &toolErrorBody{Code: code, Message: msg}}
+		if err := o.emitTool(c, "finished", code); err != nil {
+			return err
+		}
 		return nil
 	}
 
-	raw, err := json.Marshal(tr.value)
+	raw, err := encodeValue(tr.value)
 	if err != nil {
 		c.errorCode = "invalid_result"
-		c.response = &toolResponse{ID: c.id, OK: false, Error: &toolErrorBody{Code: "invalid_result", Message: err.Error()}}
-		return nil
+		if oerr := o.emitTool(c, "finished", "invalid_result"); oerr != nil {
+			return oerr
+		}
+		return newError(KindProtocolError, StatusProtocolError, "tool", o.result.ExecutionID, "invalid tool result: "+err.Error(), err)
 	}
 	if len(raw) > o.maxToolResultBytes {
 		c.errorCode = "result_too_large"
-		c.response = &toolResponse{ID: c.id, OK: false, Error: &toolErrorBody{Code: "result_too_large", Message: fmt.Sprintf("tool result exceeds %d bytes", o.maxToolResultBytes)}}
-		return nil
+		if oerr := o.emitTool(c, "finished", "result_too_large"); oerr != nil {
+			return oerr
+		}
+		return newError(KindLimitExceeded, StatusLimitExceeded, "tool", o.result.ExecutionID, fmt.Sprintf("tool result exceeds %d bytes", o.maxToolResultBytes), nil)
 	}
 	c.response = &toolResponse{ID: c.id, OK: true, Value: json.RawMessage(raw)}
+	if oerr := o.emitTool(c, "finished", ""); oerr != nil {
+		return oerr
+	}
 	return nil
 }
 
@@ -811,6 +965,49 @@ func (o *executionOwner) ledger() []CallLedgerEntry {
 	return out
 }
 
+// emit delivers one observation to the observer. The execution owner is the
+// only caller, so observations are serial. A panicking observer is recovered
+// and classified as HostFault; the observer is not called again.
+func (o *executionOwner) emit(obs Observation) *Error {
+	if o.req.Observer == nil || o.observerFailed {
+		return nil
+	}
+	var perr any
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				perr = p
+			}
+		}()
+		o.req.Observer(obs)
+	}()
+	if perr != nil {
+		o.observerFailed = true
+		return newError(KindHostFault, StatusGuestFault, "observer", o.result.ExecutionID, fmt.Sprintf("observer panic: %v", perr), nil)
+	}
+	return nil
+}
+
+func (o *executionOwner) emitOutput(out Output) *Error {
+	switch out.Type {
+	case "text":
+		return o.emit(Observation{Kind: ObservationText, Text: out.Text})
+	case "console":
+		return o.emit(Observation{Kind: ObservationConsole, Text: out.Text, Level: out.Level})
+	}
+	return nil
+}
+
+func (o *executionOwner) emitTool(c *callState, phase, errCode string) *Error {
+	return o.emit(Observation{
+		Kind:     ObservationTool,
+		ToolName: c.name,
+		CallID:   c.id,
+		Phase:    phase,
+		Error:    errCode,
+	})
+}
+
 func toolErrorCode(err error) (string, string) {
 	var te *ToolError
 	if errors.As(err, &te) {
@@ -825,9 +1022,38 @@ func toolErrorCode(err error) (string, string) {
 	return "tool_error", truncateString(err.Error(), 4096)
 }
 
+func classifyToolCause(cause error, execID string) *Error {
+	switch {
+	case errors.Is(cause, context.DeadlineExceeded):
+		return newError(KindTimedOut, StatusTimedOut, "tool", execID, "execution deadline exceeded while a tool call was outstanding", cause)
+	case errors.Is(cause, context.Canceled):
+		return newError(KindCancelled, StatusCancelled, "tool", execID, "execution cancelled while a tool call was outstanding", cause)
+	default:
+		return newError(KindCancelled, StatusCancelled, "tool", execID, "execution cancelled: "+cause.Error(), cause)
+	}
+}
+
+// clipUTF8 returns the longest prefix of s that is at most max bytes and ends
+// on a UTF-8 rune boundary.
+func clipUTF8(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
+// truncateString returns the longest valid UTF-8 prefix of s that is at most
+// max bytes. It never splits a multi-byte rune, so trace and error text stay
+// valid UTF-8 under the byte cap.
 func truncateString(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max]
+	return clipUTF8(s, max)
 }

@@ -2,6 +2,7 @@ package wasmguest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -24,7 +25,11 @@ type Options struct {
 	MaxMemoryBytes  int64
 	MaxMessageBytes int
 	MaxOutputBytes  int
-	DefaultTimeout  time.Duration
+	// MaxStateBytes bounds the encoded initial and final state values. Zero
+	// inherits MaxMessageBytes. The public wrapper resolves the strict
+	// per-execution value; this is the runtime default.
+	MaxStateBytes  int
+	DefaultTimeout time.Duration
 }
 
 // Import is one artifact import discovered at compile time.
@@ -57,9 +62,32 @@ type Request struct {
 	Filename string
 	Timeout  time.Duration
 
+	// InitialState is the JSON-like value loaded into the guest before source
+	// execution. Nil encodes as JSON null (Python None).
+	InitialState any
+
+	// Observer receives ordered text/console/tool observations serially from
+	// the execution owner. It must not call back into the guest. A panic is
+	// recovered and classified as HostFault.
+	Observer Observer
+
 	// Tools is the per-execution tool snapshot. It is only used by
 	// ExecuteWithTools; Execute clears it.
 	Tools map[string]ToolHandler
+
+	// MaxMemoryBytes is accepted for public-wrapper compatibility. The
+	// runtime's global memory cap is authoritative; per-request memory limits
+	// are not supported by this host.
+	MaxMemoryBytes int64
+
+	// MaxOutputBytes tightens the runtime output cap for this execution. Zero
+	// inherits Options.MaxOutputBytes.
+	MaxOutputBytes int
+
+	// MaxStateBytes tightens the runtime state cap for this execution. Zero
+	// inherits Options.MaxStateBytes (which itself defaults to
+	// Options.MaxMessageBytes).
+	MaxStateBytes int
 
 	MaxConcurrentToolCalls int
 	MaxToolCalls           int
@@ -71,18 +99,23 @@ type Request struct {
 // Result is the host-observed outcome of one execution. It is intentionally
 // spike-shaped, not the public QuickPy Result.
 type Result struct {
-	ExecutionID         string        `json:"execution_id"`
-	InstanceID          string        `json:"instance_id"`
-	Status              Status        `json:"status"`
-	Outputs             []Output      `json:"outputs,omitempty"`
-	Exception           *Exception    `json:"exception,omitempty"`
-	CapturedStdout      string        `json:"captured_stdout,omitempty"`
-	CapturedStderr      string        `json:"captured_stderr,omitempty"`
-	StdoutTruncated     bool          `json:"stdout_truncated,omitempty"`
-	StderrTruncated     bool          `json:"stderr_truncated,omitempty"`
-	OutputTruncated     bool          `json:"output_truncated,omitempty"`
-	Stalled             bool          `json:"stalled,omitempty"`
-	UnknownFields       []string      `json:"unknown_fields,omitempty"`
+	ExecutionID     string     `json:"execution_id"`
+	InstanceID      string     `json:"instance_id"`
+	Status          Status     `json:"status"`
+	Outputs         []Output   `json:"outputs,omitempty"`
+	Exception       *Exception `json:"exception,omitempty"`
+	CapturedStdout  string     `json:"captured_stdout,omitempty"`
+	CapturedStderr  string     `json:"captured_stderr,omitempty"`
+	StdoutTruncated bool       `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool       `json:"stderr_truncated,omitempty"`
+	OutputTruncated bool       `json:"output_truncated,omitempty"`
+	Stalled         bool       `json:"stalled,omitempty"`
+	UnknownFields   []string   `json:"unknown_fields,omitempty"`
+	// State is the committed final state. It is only set on a successful
+	// completed execution. StateWritten distinguishes set_state(None)
+	// (State nil, StateWritten true) from no write (State nil, false).
+	State               any           `json:"state,omitempty"`
+	StateWritten        bool          `json:"state_written,omitempty"`
 	Duration            time.Duration `json:"-"`
 	DurationMS          float64       `json:"duration_ms"`
 	Guest               GuestInfo     `json:"guest"`
@@ -205,10 +238,11 @@ func (r *Runtime) Close(ctx context.Context) error {
 }
 
 type startMessage struct {
-	V        int    `json:"v"`
-	Type     string `json:"type"`
-	Source   string `json:"source"`
-	Filename string `json:"filename"`
+	V            int             `json:"v"`
+	Type         string          `json:"type"`
+	Source       string          `json:"source"`
+	Filename     string          `json:"filename"`
+	InitialState json.RawMessage `json:"initial_state"`
 }
 
 func classifyCause(cause error, execID string) *Error {

@@ -38,7 +38,7 @@
 #include "py/stackctrl.h"
 
 #ifndef MICROPY_HEAP_SIZE
-#define MICROPY_HEAP_SIZE (1024 * 1024)
+#define MICROPY_HEAP_SIZE (4 * 1024 * 1024)
 #endif
 
 // The imported quickpy module owns the main task, pending futures, and the
@@ -181,6 +181,9 @@ typedef struct {
     size_t filename_len;
     char *responses;
     size_t responses_len;
+    char *initial_state;
+    size_t initial_state_len;
+    bool has_initial_state;
     bool gc;
 } request_t;
 
@@ -434,6 +437,7 @@ static void request_free(request_t *r) {
     free(r->source);
     free(r->filename);
     free(r->responses);
+    free(r->initial_state);
     memset(r, 0, sizeof(*r));
 }
 
@@ -470,6 +474,14 @@ static int parse_request(const char *buf, size_t len, request_t *r) {
             free(r->responses);
             r->responses = NULL;
             rc = jp_value_raw(&j, &r->responses, &r->responses_len);
+        } else if (key_len == 13 && memcmp(key, "initial_state", 13) == 0) {
+            free(r->initial_state);
+            r->initial_state = NULL;
+            r->has_initial_state = false;
+            rc = jp_value_raw(&j, &r->initial_state, &r->initial_state_len);
+            if (rc == 0) {
+                r->has_initial_state = true;
+            }
         } else if (key_len == 2 && memcmp(key, "gc", 2) == 0) {
             if (j.end - j.p >= 4 && memcmp(j.p, "true", 4) == 0) {
                 j.p += 4;
@@ -928,6 +940,50 @@ static int call_python_deliver(int64_t id, bool ok, const char *value_json, cons
     return -2;
 }
 
+// Returns 0 on success, 1 on Python exception (captured).
+static int call_python_set_initial_state(const char *json, size_t len) {
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t fun = mp_load_attr(MP_STATE_VM(quickpy_module), MP_QSTR__set_initial_state);
+        mp_obj_t arg = json ? mp_obj_new_str(json, len) : mp_const_none;
+        mp_call_function_1(fun, arg);
+        nlr_pop();
+        return 0;
+    }
+    capture_exception((mp_obj_t)nlr.ret_val);
+    return 1;
+}
+
+// Returns 0 on success, 1 on Python exception (captured), -1 on allocation
+// failure.  *out is NULL when no set_state() call occurred; otherwise it is a
+// malloc'd JSON text owned by the caller (including the text "null").
+static int call_python_state_json(char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t fun = mp_load_attr(MP_STATE_VM(quickpy_module), MP_QSTR__state_json);
+        mp_obj_t res = mp_call_function_0(fun);
+        if (res != mp_const_none) {
+            size_t len = 0;
+            const char *s = mp_obj_str_get_data(res, &len);
+            char *buf = (char *)malloc(len + 1);
+            if (buf == NULL) {
+                nlr_pop();
+                return -1;
+            }
+            memcpy(buf, s, len);
+            buf[len] = '\0';
+            *out = buf;
+            *out_len = len;
+        }
+        nlr_pop();
+        return 0;
+    }
+    capture_exception((mp_obj_t)nlr.ret_val);
+    return 1;
+}
+
 typedef struct {
     int64_t id;
     bool ok;
@@ -1051,7 +1107,8 @@ static int deliver_responses(const char *json, size_t len) {
     return j.p == j.end ? 0 : -1;
 }
 
-static int build_response(sb_t *resp, int failed) {
+static int build_response(sb_t *resp, int failed, bool state_written,
+    const char *state_json, size_t state_json_len) {
     if (sb_puts(resp, "{\"v\":0,\"type\":") != 0) return -1;
     if (sb_puts(resp, failed ? "\"failed\"" : "\"completed\"") != 0) return -1;
     if (sb_puts(resp, ",\"output\":") != 0) return -1;
@@ -1070,6 +1127,16 @@ static int build_response(sb_t *resp, int failed) {
             if (sb_puts(resp, ",\"traceback_truncated\":true") != 0) return -1;
         }
         if (sb_puts(resp, "}") != 0) return -1;
+    } else {
+        // State is only offered on a successful completed response.  The
+        // field is always present so the host can distinguish "no write"
+        // (false, no state) from set_state(None) (true, state:null).
+        if (sb_puts(resp, ",\"state_written\":") != 0) return -1;
+        if (sb_puts(resp, state_written ? "true" : "false") != 0) return -1;
+        if (state_written) {
+            if (sb_puts(resp, ",\"state\":") != 0) return -1;
+            if (sb_putn(resp, state_json, state_json_len) != 0) return -1;
+        }
     }
     return sb_puts(resp, "}");
 }
@@ -1101,7 +1168,9 @@ static int build_suspended_response(sb_t *resp, int stalled) {
 
 __attribute__((export_name("qp_abi_version")))
 int32_t qp_abi_version(void) {
-    return 1; // packed major/minor 0.1
+    // Packed major/minor 0.2.  M1 state is additive but old 0.1 hosts would
+    // silently ignore initial_state, so the host must require 2.
+    return 2;
 }
 
 __attribute__((export_name("qp_alloc")))
@@ -1138,7 +1207,7 @@ int64_t qp_invoke(int32_t ptr, int32_t len) {
 
     if (ensure_init() != 0) {
         sb_t resp = {0};
-        if (build_response(&resp, 1) != 0) {
+        if (build_response(&resp, 1, false, NULL, 0) != 0) {
             sb_free(&resp);
             return -1;
         }
@@ -1175,8 +1244,18 @@ int64_t qp_invoke(int32_t ptr, int32_t len) {
                 set_protocol_error("start already executed");
                 failed = 1;
             } else {
-                g_started = true;
-                failed = run_source(req.source, req.source_len, req.filename);
+                // initial_state is optional.  Absent and explicit null both
+                // mean Python None; the value is validated and copied by the
+                // guest before any source runs.
+                if (req.has_initial_state) {
+                    if (call_python_set_initial_state(req.initial_state, req.initial_state_len) != 0) {
+                        failed = 1;
+                    }
+                }
+                if (!failed) {
+                    g_started = true;
+                    failed = run_source(req.source, req.source_len, req.filename);
+                }
             }
         } else if (type_is(&req, "tool_responses")) {
             get_quickpy_state(state, sizeof(state));
@@ -1212,24 +1291,42 @@ int64_t qp_invoke(int32_t ptr, int32_t len) {
         }
     }
 
+    bool state_written = false;
+    char *state_json = NULL;
+    size_t state_json_len = 0;
+
     if (!failed) {
         get_quickpy_state(state, sizeof(state));
+        // Only a genuinely completed execution may offer committable state.
+        // Suspended/stalled responses keep the pending value guest-side.
+        if (strcmp(state, "completed") == 0 || strcmp(state, "idle") == 0) {
+            int src = call_python_state_json(&state_json, &state_json_len);
+            if (src == 1) {
+                failed = 1;
+            } else if (src == -1) {
+                set_protocol_error("state serialization failed");
+                failed = 1;
+            } else {
+                state_written = (state_json != NULL);
+            }
+        }
     }
 
     sb_t resp = {0};
     int rc;
     if (failed) {
-        rc = build_response(&resp, 1);
+        rc = build_response(&resp, 1, false, NULL, 0);
     } else if (strcmp(state, "suspended") == 0) {
         rc = build_suspended_response(&resp, 0);
     } else if (strcmp(state, "stalled") == 0) {
         rc = build_suspended_response(&resp, 1);
     } else if (strcmp(state, "completed") == 0 || strcmp(state, "idle") == 0) {
-        rc = build_response(&resp, 0);
+        rc = build_response(&resp, 0, state_written, state_json, state_json_len);
     } else {
         set_protocol_error("adapter state not quiescent");
-        rc = build_response(&resp, 1);
+        rc = build_response(&resp, 1, false, NULL, 0);
     }
+    free(state_json);
     if (rc != 0) {
         sb_free(&resp);
         request_free(&req);

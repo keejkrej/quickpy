@@ -46,6 +46,14 @@ type Response struct {
 	Awaiting        []int64
 	Stalled         bool
 	UnknownFields   []string
+
+	// StateWritten and StateRaw are only meaningful on a completed response.
+	// StateRaw is the raw JSON value of the state field; it is decoded by the
+	// execution owner with the resolved state bound so a malformed or
+	// oversized final value is rejected without committing anything.
+	StateWritten bool
+	StateRaw     json.RawMessage
+	StatePresent bool
 }
 
 var topLevelKeys = map[string]bool{
@@ -59,6 +67,8 @@ var topLevelKeys = map[string]bool{
 	"calls":            true,
 	"awaiting":         true,
 	"stalled":          true,
+	"state":            true,
+	"state_written":    true,
 }
 
 var callKeys = map[string]bool{
@@ -83,8 +93,10 @@ var exceptionKeys = map[string]bool{
 
 // decodeResponse decodes a guest response. It tolerates unknown fields (and
 // reports them) but rejects malformed JSON, duplicate keys, wrong protocol
-// versions, wrong message types, unknown output types, and oversized output.
-func decodeResponse(data []byte, maxOutputBytes int) (*Response, *Error) {
+// versions, wrong message types, and unknown output types. Output size is
+// enforced cumulatively by the execution owner so the retained prefix and the
+// observer stream are clipped consistently.
+func decodeResponse(data []byte) (*Response, *Error) {
 	if len(data) == 0 {
 		return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "empty guest response", nil)
 	}
@@ -263,9 +275,6 @@ func decodeResponse(data []byte, maxOutputBytes int) (*Response, *Error) {
 		if err := json.Unmarshal(outputRaw, &text); err != nil {
 			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response output is not a string", err)
 		}
-		if len(text) > maxOutputBytes {
-			return nil, newError(KindLimitExceeded, StatusLimitExceeded, "decode", "", fmt.Sprintf("guest response output exceeds %d bytes", maxOutputBytes), nil)
-		}
 		resp.Outputs = append(resp.Outputs, Output{Type: "text", Text: text})
 	}
 
@@ -280,7 +289,6 @@ func decodeResponse(data []byte, maxOutputBytes int) (*Response, *Error) {
 		if err := json.Unmarshal(raw, &rawOutputs); err != nil {
 			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response outputs is not an array", err)
 		}
-		total := 0
 		for i, rawOut := range rawOutputs {
 			var m map[string]json.RawMessage
 			if err := json.Unmarshal(rawOut, &m); err != nil {
@@ -301,7 +309,6 @@ func decodeResponse(data []byte, maxOutputBytes int) (*Response, *Error) {
 				if err := json.Unmarshal(m["text"], &text); err != nil {
 					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].text is not a string", i), err)
 				}
-				total += len(text)
 				resp.Outputs = append(resp.Outputs, Output{Type: "text", Text: text})
 			case "console":
 				var text string
@@ -314,13 +321,9 @@ func decodeResponse(data []byte, maxOutputBytes int) (*Response, *Error) {
 						return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].level is not a string", i), err)
 					}
 				}
-				total += len(text)
 				resp.Outputs = append(resp.Outputs, Output{Type: "console", Text: text, Level: level})
 			default:
 				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("unsupported guest output type %q", outType), nil)
-			}
-			if total > maxOutputBytes {
-				return nil, newError(KindLimitExceeded, StatusLimitExceeded, "decode", "", fmt.Sprintf("guest response output exceeds %d bytes", maxOutputBytes), nil)
 			}
 		}
 	}
@@ -365,6 +368,31 @@ func decodeResponse(data []byte, maxOutputBytes int) (*Response, *Error) {
 			}
 		}
 		resp.Exception = ex
+	}
+
+	// A completed response is a success and must never carry error details.
+	// Only a failed response may carry a structured exception; a completed
+	// response that also carries an error object is a protocol violation and
+	// must never be surfaced as a successful completion.
+	if resp.Type == "completed" && resp.Exception != nil {
+		return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "completed response must not include error details", nil)
+	}
+
+	// State is only committable on a genuinely completed response. Fields on
+	// failed/suspended responses are tolerated but ignored by the owner.
+	if resp.Type == "completed" {
+		if raw, ok := top["state_written"]; ok && !isJSONNull(raw) {
+			if err := json.Unmarshal(raw, &resp.StateWritten); err != nil {
+				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response state_written is not a boolean", err)
+			}
+		}
+		if raw, ok := top["state"]; ok {
+			resp.StatePresent = true
+			resp.StateRaw = append(json.RawMessage(nil), raw...)
+		}
+		if resp.StateWritten && !resp.StatePresent {
+			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "completed response with state_written:true is missing state", nil)
+		}
 	}
 
 	sort.Strings(resp.UnknownFields)

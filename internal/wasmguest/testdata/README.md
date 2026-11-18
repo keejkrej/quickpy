@@ -6,10 +6,12 @@ exercise the Go/wazero host adapter in `internal/wasmguest`:
 
 | File | Purpose |
 |---|---|
-| `completed.wasm` | ABI 0.1, returns a `completed` response with one text output. |
+| `completed.wasm` | ABI 0.2 (integer 2), returns a `completed` response with one text output and no state fields. |
+| `completed_with_error.wasm` | A real-shaped `completed` response that also carries output, `state_written:true`, `state:null`, and an `error` object, for protocol-rejection tests. |
 | `failed.wasm` | Returns a `failed` response with a structured `ValueError`. |
 | `loop.wasm` | `qp_invoke` spins forever, for host-led timeout/cancel tests. |
-| `badversion.wasm` | `qp_abi_version` returns 2, for ABI mismatch tests. |
+| `badversion.wasm` | `qp_abi_version` returns 3, for future-version rejection tests. |
+| `oldversion.wasm` | `qp_abi_version` returns 1, for old-version rejection tests. |
 | `malformed.wasm` | Returns truncated JSON, for protocol-error tests. |
 | `import_path_open.wasm` | Imports `wasi_snapshot_preview1.path_open`, for allowlist tests. |
 | `import_environ_get.wasm` | Imports `wasi_snapshot_preview1.environ_get`, for empty-allowlist tests. |
@@ -32,6 +34,16 @@ exercise the Go/wazero host adapter in `internal/wasmguest`:
 | `async_runnable_stalled.wasm` | Contradictory `runnable` with `stalled:true`, for protocol rejection tests. |
 | `async_stalled_pending.wasm` | `stalled:true` while a call is still pending, for protocol rejection tests. |
 | `async_stalled_after_delivery.wasm` | `stalled:true` after a call was delivered, for terminal Stalled tests. |
+| `async_pending_reuse.wasm` | Delivers call 1, then requests call 2, for pending-count-versus-tombstone tests. |
+| `output_deltas.wasm` | Emits `AAAA`, then `BBBB`, then `CCCC` across suspensions, for cumulative output clipping tests. |
+| `state_value.wasm` | Completed with `state_written:true` and a JSON-like `state` value. |
+| `state_null.wasm` | Completed with `state_written:true` and `state:null` (explicit None). |
+| `state_false.wasm` | Completed with `state_written:false` and no state. |
+| `state_missing.wasm` | Completed with `state_written:true` but no `state`, for protocol rejection. |
+| `state_out_of_range.wasm` | Completed with an out-of-int64-range state integer, for strict value rejection. |
+| `state_oversize.wasm` | Completed with a 200-byte state string, for state-cap rejection. |
+| `state_on_failed.wasm` | Failed response carrying state fields, to prove they are ignored. |
+| `state_on_suspended.wasm` | Suspended response carrying state fields, then a completed response with no write. |
 
 They are compiled from `src/*.c` with Zig's freestanding WASM target. The
 committed `.wasm` files are what the tests use; Zig is not required to run the
