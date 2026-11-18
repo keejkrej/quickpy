@@ -6,13 +6,18 @@ exercise the Go/wazero host adapter in `internal/wasmguest`:
 
 | File | Purpose |
 |---|---|
-| `completed.wasm` | ABI 0.2 (integer 2), returns a `completed` response with one text output and no state fields. |
+| `completed.wasm` | ABI 0.4 (integer 4), returns a `completed` response with engine metadata, one legacy text output, and no state fields. |
 | `completed_with_error.wasm` | A real-shaped `completed` response that also carries output, `state_written:true`, `state:null`, and an `error` object, for protocol-rejection tests. |
-| `failed.wasm` | Returns a `failed` response with a structured `ValueError`. |
+| `failed.wasm` | Returns a `failed` response with a structured `ValueError` and no `tool_cause`. |
+| `failed_tool_cause.wasm` | Returns a `failed` response with a structured `ToolError` and `tool_cause` (`code`, `message`, `tool`, `call_id`). |
 | `loop.wasm` | `qp_invoke` spins forever, for host-led timeout/cancel tests. |
-| `badversion.wasm` | `qp_abi_version` returns 3, for future-version rejection tests. |
-| `oldversion.wasm` | `qp_abi_version` returns 1, for old-version rejection tests. |
+| `badversion.wasm` | `qp_abi_version` returns 5, for future-version rejection tests. |
+| `oldversion.wasm` | `qp_abi_version` returns 2, for old-version rejection tests. |
+| `abi3.wasm` | `qp_abi_version` returns 3, for explicit ABI3 rejection tests. |
 | `malformed.wasm` | Returns truncated JSON, for protocol-error tests. |
+| `memory_grow_fail.wasm` | Calls `memory.grow` beyond the configured cap and returns a guest-reported `MemoryError`; proves the host does not fake `LimitExceeded`. |
+| `memory_limit.wasm` | Declares two initial memory pages; a one-page host cap is rejected at compile time as `LimitExceeded`. |
+| `trap_oob.wasm` | Performs an arbitrary out-of-bounds store; proves an unattributed trap stays `GuestFault`. |
 | `import_path_open.wasm` | Imports `wasi_snapshot_preview1.path_open`, for allowlist tests. |
 | `import_environ_get.wasm` | Imports `wasi_snapshot_preview1.environ_get`, for empty-allowlist tests. |
 | `import_args_get.wasm` | Imports `wasi_snapshot_preview1.args_get`, for empty-allowlist tests. |
@@ -36,6 +41,20 @@ exercise the Go/wazero host adapter in `internal/wasmguest`:
 | `async_stalled_after_delivery.wasm` | `stalled:true` after a call was delivered, for terminal Stalled tests. |
 | `async_pending_reuse.wasm` | Delivers call 1, then requests call 2, for pending-count-versus-tombstone tests. |
 | `output_deltas.wasm` | Emits `AAAA`, then `BBBB`, then `CCCC` across suspensions, for cumulative output clipping tests. |
+| `outputs_order.wasm` | Completed with a structured `outputs` array (text, console, image, text) plus a legacy `output` string, for ordering and no-double-count tests. |
+| `outputs_deltas_array.wasm` | Emits structured output deltas across two suspensions and a completion, for per-invocation delta tests. |
+| `outputs_image_clip.wasm` | Completed with text then a 10-byte image, for cumulative image-prefix clipping tests. |
+| `outputs_image_oversize.wasm` | Completed with a 20-byte image, for single-image cumulative output clipping and message-cap tests. |
+| `outputs_failed_partial.wasm` | Failed response with structured text/console output, for partial-output retention tests. |
+| `outputs_stalled_partial.wasm` | Terminal stalled response with structured text/image output, for partial-output retention tests. |
+| `outputs_cancel_partial.wasm` | Suspends with structured text/console output and a blocking call, for cancellation partial-output retention tests. |
+| `outputs_invalid_level.wasm` | Console output with an invalid level, for protocol rejection. |
+| `outputs_invalid_base64.wasm` | Image output with invalid base64, for protocol rejection. |
+| `outputs_invalid_mime.wasm` | Image output with an invalid MIME type, for protocol rejection. |
+| `outputs_unknown_type.wasm` | Output with an unknown type, for protocol rejection. |
+| `outputs_invalid_utf8.wasm` | Text output containing invalid UTF-8, for protocol rejection. |
+| `outputs_empty_array.wasm` | Explicit empty `outputs` array plus a legacy `output` string, to prove the legacy string is ignored. |
+| `outputs_null_array.wasm` | `outputs:null` plus a legacy `output` string, to prove the legacy fallback. |
 | `state_value.wasm` | Completed with `state_written:true` and a JSON-like `state` value. |
 | `state_null.wasm` | Completed with `state_written:true` and `state:null` (explicit None). |
 | `state_false.wasm` | Completed with `state_written:false` and no state. |

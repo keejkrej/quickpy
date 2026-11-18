@@ -44,6 +44,7 @@ type Error struct {
 	Message       string
 	Cause         error
 	Exception     *Exception
+	ToolCause     *ToolCause
 	UnknownFields []string
 }
 

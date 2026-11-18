@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strconv"
 
 	"github.com/keejkrej/quickpy/internal/wasmguest"
 )
@@ -78,17 +79,21 @@ func (e *wasmEngine) Execute(ctx context.Context, req engineRequest) (engineResu
 		MaxStateBytes:  req.MaxStateBytes,
 	}
 	res, err := e.rt.ExecuteWithTools(ctx, wreq)
-	if err != nil {
-		return engineResult{}, mapWasmError(err, "")
+	out := engineResult{}
+	if res != nil {
+		out = engineResult{
+			Status:       mapStatus(res.Status),
+			State:        res.State,
+			StateWritten: res.StateWritten,
+			ToolCalls:    res.ToolCalls,
+			Duration:     res.Duration,
+			Guest:        mapGuest(res.Guest),
+		}
 	}
-	return engineResult{
-		Status:       mapStatus(res.Status),
-		State:        res.State,
-		StateWritten: res.StateWritten,
-		ToolCalls:    res.ToolCalls,
-		Duration:     res.Duration,
-		Guest:        mapGuest(res.Guest),
-	}, nil
+	if err != nil {
+		return out, mapWasmError(err, "")
+	}
+	return out, nil
 }
 
 func (e *wasmEngine) Close(ctx context.Context) error {
@@ -156,6 +161,20 @@ func mapWasmError(err error, execID string) *Error {
 				Line:      we.Exception.Line,
 			}
 		}
+		tc := we.ToolCause
+		if tc == nil && we.Exception != nil {
+			tc = we.Exception.ToolCause
+		}
+		if tc != nil {
+			out.Tool = &ToolCause{
+				Tool:    tc.Tool,
+				Code:    tc.Code,
+				Message: tc.Message,
+			}
+			if tc.CallID != nil {
+				out.Tool.CallID = strconv.FormatInt(*tc.CallID, 10)
+			}
+		}
 		return out
 	}
 	return &Error{Kind: KindHostFault, Status: StatusFailed, ExecutionID: execID, Op: "execute", Message: err.Error(), Cause: err}
@@ -214,9 +233,26 @@ func mapGuest(g wasmguest.GuestInfo) GuestInfo {
 	for i, imp := range g.Imports {
 		imports[i] = Import{Kind: imp.Kind, Module: imp.Module, Name: imp.Name}
 	}
+	engine := g.Engine
+	if engine == "" {
+		engine = "micropython"
+	}
+	version := g.Version
+	if version == "" {
+		// An ABI 0.4 guest always reports its version. If an artifact somehow
+		// omits it, report that honestly instead of pretending the identity is
+		// complete.
+		version = "unknown"
+	}
+	protocol := g.ProtocolVersion
+	if protocol == "" {
+		// The JSON protocol envelope is v0 for every supported ABI.
+		protocol = "0"
+	}
 	return GuestInfo{
-		Engine:          "micropython",
-		ProtocolVersion: "0",
+		Engine:          engine,
+		Version:         version,
+		ProtocolVersion: protocol,
 		ABIVersion:      g.ABIVersion,
 		Imports:         imports,
 	}

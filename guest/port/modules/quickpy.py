@@ -9,10 +9,42 @@ import json
 import _quickpy
 
 class ToolError(Exception):
-    def __init__(self, code, message):
+    # Base class for every catchable tool failure.  `except quickpy.ToolError`
+    # catches all subclasses.  `tool` and `call_id` are populated when the
+    # failure is tied to a dispatched call; they stay None for failures raised
+    # before a call is registered (for example argument validation).
+    def __init__(self, code, message, tool=None, call_id=None):
         self.code = code
         self.message = message
+        self.tool = tool
+        self.call_id = call_id
         super().__init__(message)
+
+
+class ToolNotFoundError(ToolError):
+    # The host reported that the requested tool is not registered.
+    pass
+
+
+class ToolArgumentError(ToolError):
+    # The script supplied arguments the guest cannot encode, or the host
+    # rejected the argument payload.
+    pass
+
+
+class ToolLimitError(ToolError):
+    # The execution's total tool-call cap would be exceeded.
+    pass
+
+
+def _tool_error(code, message, tool, call_id):
+    # Map a host error code to the most specific catchable class.  Unknown
+    # codes stay the base ToolError so callers can still catch them.
+    if code == "tool_not_found":
+        return ToolNotFoundError(code, message, tool=tool, call_id=call_id)
+    if code == "tool_argument":
+        return ToolArgumentError(code, message, tool=tool, call_id=call_id)
+    return ToolError(code, message, tool=tool, call_id=call_id)
 
 
 class StateError(Exception):
@@ -48,7 +80,7 @@ class _HostFuture:
         if self.done:
             return False
         self.done = True
-        self.error = ToolError(code, message)
+        self.error = _tool_error(code, message, self.name, self.call_id)
         if self.waiting is not None:
             asyncio.core._task_queue.push(self.waiting)
             self.waiting = None
@@ -72,19 +104,74 @@ def _wait_future(fut):
     return fut.result
 
 
-async def _call_tool(name, kwargs):
+async def _call_tool(name, args, kwargs):
+    if args:
+        raise ToolArgumentError(
+            "tool_argument",
+            "tool " + str(name) + " accepts keyword arguments only",
+            tool=name,
+        )
     return await _make_call(name, kwargs)
 
 
 class _Tools:
     def __getattr__(self, name):
-        def call(**kwargs):
-            return _call_tool(name, kwargs)
+        def call(*args, **kwargs):
+            return _call_tool(name, args, kwargs)
 
         return call
 
 
 tools = _Tools()
+
+# ---------------------------------------------------------------------------
+# Structured output: console diagnostics and images.
+#
+# quickpy.console.debug/info/warn/error(*args) emits exactly one console event
+# per call.  Arguments are stringified and joined with single spaces, matching
+# print().  The level is one of the exact strings "debug", "info", "warn",
+# "error".
+#
+# quickpy.image(data, mime="image/png") emits exactly one image event and
+# returns None.  data must be bytes or bytearray and is copied at call time, so
+# later mutation of a bytearray cannot change the emitted bytes.  The MIME type
+# must be a non-empty "token/token" value with no whitespace or control
+# characters.  Invalid data, MIME, or an oversized payload raises TypeError or
+# ValueError and emits nothing.
+# ---------------------------------------------------------------------------
+
+def _join_args(args):
+    if not args:
+        return ""
+    parts = []
+    for arg in args:
+        parts.append(str(arg))
+    return " ".join(parts)
+
+
+class _Console:
+    def debug(self, *args):
+        _quickpy.emit_console("debug", _join_args(args))
+
+    def info(self, *args):
+        _quickpy.emit_console("info", _join_args(args))
+
+    def warn(self, *args):
+        _quickpy.emit_console("warn", _join_args(args))
+
+    def error(self, *args):
+        _quickpy.emit_console("error", _join_args(args))
+
+
+console = _Console()
+
+
+def image(data, mime="image/png"):
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("image data must be bytes or bytearray")
+    if not isinstance(mime, str):
+        raise TypeError("image mime must be a string")
+    _quickpy.emit_image(mime, data)
 
 # ---------------------------------------------------------------------------
 # Explicit JSON-like state.
@@ -286,12 +373,126 @@ _main_task = None
 _pending = {}
 _next_id = 1
 
+# Total tool-call cap.  -1 means unlimited; >= 0 is an inclusive cap on the
+# number of host calls this execution may request.  The adapter sets this from
+# the ABI3 start message before any source runs.
+_max_tool_calls = -1
+_tool_calls_made = 0
+
+_MAX_TOOL_ARG_BYTES = 1024 * 1024
+_MAX_TOOL_ARG_DEPTH = 64
+
+
+def _set_max_tool_calls(value):
+    global _max_tool_calls
+    _max_tool_calls = value
+
+
+def _tool_arg_error(message, tool):
+    return ToolArgumentError("tool_argument", message, tool=tool)
+
+
+def _tool_str_size(value, tool):
+    # _json_str_size is shared with state validation and raises StateError for
+    # lone surrogates; tool arguments must surface ToolArgumentError instead.
+    try:
+        return _json_str_size(value)
+    except StateError:
+        raise _tool_arg_error("tool argument strings must not contain lone surrogates", tool)
+
+
+def _spend_tool(budget, n, tool):
+    budget[0] -= n
+    if budget[0] < 0:
+        raise _tool_arg_error("tool arguments exceed the guest size limit", tool)
+
+
+def _validate_tool_value(value, depth, seen, budget, tool):
+    # Tool arguments use the same JSON-like value rules as state, but failures
+    # are ToolArgumentError so the script can catch them.  Validating before
+    # json.dumps() keeps unsupported types and cycles from reaching the host as
+    # malformed JSON.
+    if depth > _MAX_TOOL_ARG_DEPTH:
+        raise _tool_arg_error("tool arguments exceed the depth limit", tool)
+    if value is None:
+        _spend_tool(budget, 4, tool)
+        return
+    if isinstance(value, bool):
+        _spend_tool(budget, 4 if value else 5, tool)
+        return
+    if isinstance(value, int):
+        if value < _INT64_MIN or value > _INT64_MAX:
+            raise _tool_arg_error("tool argument integers must fit in int64", tool)
+        _spend_tool(budget, _int_size(value), tool)
+        return
+    if isinstance(value, float):
+        if value != value:
+            raise _tool_arg_error("tool argument floats must be finite", tool)
+        if value != 0 and value == value * 2:
+            raise _tool_arg_error("tool argument floats must be finite", tool)
+        _spend_tool(budget, len(str(value)), tool)
+        return
+    if isinstance(value, str):
+        _spend_tool(budget, _tool_str_size(value, tool), tool)
+        return
+    if isinstance(value, (list, tuple)):
+        if id(value) in seen:
+            raise _tool_arg_error("tool arguments must not contain cycles", tool)
+        _spend_tool(budget, 2, tool)
+        seen.append(id(value))
+        first = True
+        for item in value:
+            if not first:
+                _spend_tool(budget, 1, tool)
+            first = False
+            _validate_tool_value(item, depth + 1, seen, budget, tool)
+        seen.pop()
+        return
+    if isinstance(value, dict):
+        if id(value) in seen:
+            raise _tool_arg_error("tool arguments must not contain cycles", tool)
+        _spend_tool(budget, 2, tool)
+        seen.append(id(value))
+        first = True
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise _tool_arg_error("tool argument keys must be strings", tool)
+            if not first:
+                _spend_tool(budget, 1, tool)
+            first = False
+            _spend_tool(budget, _tool_str_size(key, tool) + 1, tool)
+            _validate_tool_value(item, depth + 1, seen, budget, tool)
+        seen.pop()
+        return
+    raise _tool_arg_error("unsupported tool argument type: " + _type_name(value), tool)
+
 
 def _make_call(name, kwargs):
-    global _next_id
+    global _next_id, _tool_calls_made
+    # Enforce the total-call cap before allocating or registering anything, so
+    # a blocked call never reaches the host.
+    if _max_tool_calls >= 0 and _tool_calls_made >= _max_tool_calls:
+        raise ToolLimitError(
+            "tool_limit",
+            "tool call limit of " + str(_max_tool_calls) + " exceeded",
+            tool=name,
+        )
+    try:
+        _validate_tool_value(kwargs, 0, [], [_MAX_TOOL_ARG_BYTES], name)
+        args_json = json.dumps(kwargs)
+    except MemoryError:
+        raise
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolArgumentError(
+            "tool_argument",
+            "invalid tool arguments: " + str(e),
+            tool=name,
+        )
     call_id = _next_id
     _next_id += 1
-    args_json = json.dumps(kwargs)
+    _tool_calls_made += 1
     fut = _HostFuture(call_id, name, args_json)
     _pending[call_id] = fut
     _quickpy.register_call(call_id, name, args_json)

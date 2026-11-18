@@ -18,6 +18,17 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
+// ABI 0.4 is the M1 conformance gate. The integer is packed major/minor.
+// ABI4 adds the structured outputs array (text, console, image) while keeping
+// the legacy text-only output string for older consumers. The JSON protocol
+// envelope remains v0; ProtocolVersion reports that envelope version, while
+// ABIVersion reports the capability gate.
+const (
+	abiVersion      = 4
+	abiVersionText  = "0.4"
+	protocolVersion = "0"
+)
+
 // Options configures the spike host. All limits are per instance except where
 // noted. The artifact is compiled once and instantiated fresh per execution.
 type Options struct {
@@ -41,8 +52,11 @@ type Import struct {
 
 // GuestInfo is the host-observed guest identity for one execution.
 type GuestInfo struct {
-	ABIVersion uint32   `json:"abi_version"`
-	Imports    []Import `json:"imports"`
+	Engine          string   `json:"engine,omitempty"`
+	Version         string   `json:"version,omitempty"`
+	ProtocolVersion string   `json:"protocol_version,omitempty"`
+	ABIVersion      uint32   `json:"abi_version"`
+	Imports         []Import `json:"imports"`
 }
 
 // ExportCalls counts guest export entries for one execution. It is evidence
@@ -90,10 +104,14 @@ type Request struct {
 	MaxStateBytes int
 
 	MaxConcurrentToolCalls int
-	MaxToolCalls           int
-	MaxPendingCalls        int
-	MaxResumes             int
-	MaxToolResultBytes     int
+	// MaxToolCalls is the total tool-call cap. Zero selects the M0 default
+	// (1000) for low-level callers; a negative value means unlimited; a
+	// positive value is an inclusive cap. The public SDK resolves its own
+	// zero ("no cap") to -1 before calling this layer.
+	MaxToolCalls       int
+	MaxPendingCalls    int
+	MaxResumes         int
+	MaxToolResultBytes int
 }
 
 // Result is the host-observed outcome of one execution. It is intentionally
@@ -243,6 +261,10 @@ type startMessage struct {
 	Source       string          `json:"source"`
 	Filename     string          `json:"filename"`
 	InitialState json.RawMessage `json:"initial_state"`
+	// MaxToolCalls is always present on an ABI 0.4 start. -1 means unlimited;
+	// >= 0 is an inclusive cap (0 forbids all tool calls). The ABI3 semantics
+	// are unchanged.
+	MaxToolCalls int `json:"max_tool_calls"`
 }
 
 func classifyCause(cause error, execID string) *Error {
@@ -262,10 +284,25 @@ func protocolErr(execID, msg string) *Error {
 
 func classifyCompileError(err error) *Error {
 	msg := err.Error()
-	if strings.Contains(msg, "over limit") || strings.Contains(msg, "memory limit") {
+	if isMemoryLimitError(err) {
 		return newError(KindLimitExceeded, StatusLimitExceeded, "new", "", "compile artifact: "+msg, err)
 	}
 	return newError(KindProtocolError, "", "new", "", "compile artifact: "+msg, err)
+}
+
+// isMemoryLimitError recognizes wazero's host-configured memory-limit errors.
+// It is deliberately only used for compile/instantiate failures, where the
+// error is produced by wazero's memory sizing/validation rather than by an
+// arbitrary guest trap. Runtime traps are never classified through this
+// helper: wazero's memory.grow returns -1 to the guest instead of trapping, so
+// a configured runtime cap hit is guest-visible (usually MemoryError) and an
+// arbitrary out-of-bounds trap remains GuestFault.
+func isMemoryLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "over limit of") || strings.Contains(msg, "memory limit")
 }
 
 func collectImports(cm wazero.CompiledModule) []Import {

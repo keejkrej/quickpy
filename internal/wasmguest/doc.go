@@ -2,7 +2,7 @@
 // low-level slice.
 //
 // It compiles a WASI reactor artifact once, instantiates a fresh module per
-// execution, performs the transient ABI handshake (ABI 0.2, integer 2), sends
+// execution, performs the transient ABI handshake (ABI 0.4, integer 4), sends
 // one length-delimited JSON start message, dispatches host tool calls, and
 // decodes completed/failed/suspended responses. It is deliberately not the
 // public QuickPy SDK: the public package wraps this package and owns the

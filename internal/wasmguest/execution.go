@@ -202,8 +202,13 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 		maxConcurrent = 8
 	}
 	maxToolCalls := req.MaxToolCalls
-	if maxToolCalls <= 0 {
+	if maxToolCalls == 0 {
+		// The low-level API keeps the M0 default finite cap for callers that
+		// do not set a value (notably the CLI). The public SDK resolves its
+		// own zero ("no cap") to -1 before reaching this layer.
 		maxToolCalls = 1000
+	} else if maxToolCalls < 0 {
+		maxToolCalls = -1
 	}
 	maxPendingCalls := req.MaxPendingCalls
 	if maxPendingCalls <= 0 {
@@ -286,6 +291,9 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 		if cause := context.Cause(callCtx); cause != nil {
 			return result, classifyCause(cause, execID)
 		}
+		if isMemoryLimitError(instErr) {
+			return result, newError(KindLimitExceeded, StatusLimitExceeded, "instantiate", execID, "instantiate failed: "+instErr.Error(), instErr)
+		}
 		return result, newError(KindGuestFault, StatusGuestFault, "instantiate", execID, "instantiate failed: "+instErr.Error(), instErr)
 	}
 	defer func() { _ = inst.Close(context.Background()) }()
@@ -314,9 +322,10 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 	}
 	version := uint32(abiRes[0])
 	result.Guest.ABIVersion = version
-	if version != 2 {
-		return result, protocolErr(execID, fmt.Sprintf("unsupported ABI version %d (want 2 = 0.2)", version))
+	if version != abiVersion {
+		return result, protocolErr(execID, fmt.Sprintf("unsupported ABI version %d (want %d = %s)", version, abiVersion, abiVersionText))
 	}
+	result.Guest.ProtocolVersion = protocolVersion
 
 	mem := inst.Memory()
 	if mem == nil {
@@ -369,6 +378,7 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 		Source:       req.Source,
 		Filename:     req.Filename,
 		InitialState: initialState,
+		MaxToolCalls: maxToolCalls,
 	})
 	if oerr != nil {
 		owner.cancelAll()
@@ -397,6 +407,10 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 			owner.finishAll()
 			result.Status = StatusFailed
 			result.Exception = resp.Exception
+			var toolCause *ToolCause
+			if resp.Exception != nil {
+				toolCause = resp.Exception.ToolCause
+			}
 			return result, &Error{
 				Kind:          KindScriptError,
 				Status:        StatusFailed,
@@ -404,6 +418,7 @@ func (r *Runtime) execute(ctx context.Context, req Request) (result *Result, wer
 				Op:            "execute",
 				Message:       "guest reported failure",
 				Exception:     resp.Exception,
+				ToolCause:     toolCause,
 				UnknownFields: resp.UnknownFields,
 			}
 
@@ -532,6 +547,12 @@ func (o *executionOwner) invoke(msg any) (*Response, *Error) {
 		return nil, classifyCause(cause, o.result.ExecutionID)
 	}
 	if ierr != nil {
+		// A trap is not attributable to a configured limit from the host
+		// side. wazero's memory.grow returns -1 to the guest instead of
+		// trapping, so a configured runtime memory cap hit is guest-visible
+		// (usually MemoryError) and is ScriptError if uncaught. Arbitrary
+		// out-of-bounds traps stay GuestFault; do not classify them as
+		// LimitExceeded.
 		return nil, newError(KindGuestFault, StatusGuestFault, "invoke", o.result.ExecutionID, "qp_invoke trapped: "+ierr.Error(), ierr)
 	}
 
@@ -567,10 +588,16 @@ func (o *executionOwner) invoke(msg any) (*Response, *Error) {
 		return nil, newError(KindGuestFault, StatusGuestFault, "free", o.result.ExecutionID, "qp_free(input) failed: "+ferr.Error(), ferr)
 	}
 
-	resp, derr := decodeResponse(respCopy)
+	resp, derr := decodeResponseWithMessageLimit(respCopy, o.rt.opts.MaxMessageBytes)
 	if derr != nil {
 		derr.ExecutionID = o.result.ExecutionID
 		return nil, derr
+	}
+	if resp.EngineName != "" {
+		o.result.Guest.Engine = resp.EngineName
+	}
+	if resp.EngineVersion != "" {
+		o.result.Guest.Version = resp.EngineVersion
 	}
 	o.trace = append(o.trace, "response: "+resp.Type)
 	if resp.Exception != nil {
@@ -592,35 +619,79 @@ func (o *executionOwner) freeGuest(ptr, length uint32) error {
 
 // accumulateOutput stores and observes output deltas. It clips each delta to
 // the remaining cumulative cap before storing or observing it, so the retained
-// result prefix and the observer stream never exceed the resolved cap. The
-// first clipped delta makes the execution fail deterministically with
-// LimitExceeded; the retained prefix stays available on the result.
+// result prefix and the observer stream never exceed the resolved cap. Text and
+// console deltas are counted by their UTF-8 text bytes; image deltas are
+// counted by their raw decoded bytes. The first clipped delta makes the
+// execution fail deterministically with LimitExceeded; the retained prefix
+// stays available on the result.
+//
+// A single image larger than the total cap is clipped to a raw binary prefix
+// exactly like an image that no longer fits after earlier output. The decoder
+// only enforces a message-derived allocation bound; the public output cap is
+// applied here, before the observer or result sees the bytes.
 func (o *executionOwner) accumulateOutput(resp *Response) *Error {
 	for _, out := range resp.Outputs {
-		if out.Type == "text" && out.Text == "" {
-			continue
-		}
-		text := out.Text
-		if o.totalOutput >= o.maxOutputBytes {
-			o.result.OutputTruncated = true
-			o.outputLimitHit = true
-			continue
-		}
-		remaining := o.maxOutputBytes - o.totalOutput
-		if len(text) > remaining {
-			text = clipUTF8(text, remaining)
-			o.result.OutputTruncated = true
-			o.outputLimitHit = true
-		}
-		if text == "" && out.Text != "" {
-			continue
-		}
-		stored := out
-		stored.Text = text
-		o.result.Outputs = append(o.result.Outputs, stored)
-		o.totalOutput += len(text)
-		if err := o.emitOutput(stored); err != nil {
-			return err
+		switch out.Type {
+		case "text":
+			if out.Text == "" {
+				continue
+			}
+			text := out.Text
+			if o.totalOutput >= o.maxOutputBytes {
+				o.markOutputLimit()
+				continue
+			}
+			remaining := o.maxOutputBytes - o.totalOutput
+			if len(text) > remaining {
+				text = clipUTF8(text, remaining)
+				o.markOutputLimit()
+			}
+			if text == "" && out.Text != "" {
+				continue
+			}
+			stored := out
+			stored.Text = text
+			o.result.Outputs = append(o.result.Outputs, stored)
+			o.totalOutput += len(text)
+			if err := o.emitOutput(stored); err != nil {
+				return err
+			}
+		case "console":
+			text := out.Text
+			if o.totalOutput >= o.maxOutputBytes {
+				o.markOutputLimit()
+				continue
+			}
+			remaining := o.maxOutputBytes - o.totalOutput
+			if len(text) > remaining {
+				text = clipUTF8(text, remaining)
+				o.markOutputLimit()
+			}
+			stored := out
+			stored.Text = text
+			o.result.Outputs = append(o.result.Outputs, stored)
+			o.totalOutput += len(text)
+			if err := o.emitOutput(stored); err != nil {
+				return err
+			}
+		case "image":
+			data := out.Data
+			if o.totalOutput >= o.maxOutputBytes {
+				o.markOutputLimit()
+				continue
+			}
+			remaining := o.maxOutputBytes - o.totalOutput
+			if len(data) > remaining {
+				data = data[:remaining]
+				o.markOutputLimit()
+			}
+			stored := out
+			stored.Data = append([]byte(nil), data...)
+			o.result.Outputs = append(o.result.Outputs, stored)
+			o.totalOutput += len(data)
+			if err := o.emitOutput(stored); err != nil {
+				return err
+			}
 		}
 	}
 	o.result.UnknownFields = append(o.result.UnknownFields, resp.UnknownFields...)
@@ -634,6 +705,11 @@ func (o *executionOwner) accumulateOutput(resp *Response) *Error {
 		return newError(KindLimitExceeded, StatusLimitExceeded, "output", o.result.ExecutionID, fmt.Sprintf("total output exceeds %d bytes", o.maxOutputBytes), nil)
 	}
 	return nil
+}
+
+func (o *executionOwner) markOutputLimit() {
+	o.result.OutputTruncated = true
+	o.outputLimitHit = true
 }
 
 func (o *executionOwner) checkOutputLimits() *Error {
@@ -714,7 +790,7 @@ func (o *executionOwner) validateSuspension(resp *Response) *Error {
 		if !newAwaiting[call.ID] {
 			return protocolErr(o.result.ExecutionID, fmt.Sprintf("new call %d is not listed in awaiting", call.ID))
 		}
-		if o.maxToolCalls > 0 && o.toolCalls >= o.maxToolCalls {
+		if o.maxToolCalls >= 0 && o.toolCalls >= o.maxToolCalls {
 			return newError(KindLimitExceeded, StatusLimitExceeded, "tool", o.result.ExecutionID, fmt.Sprintf("tool call count exceeds %d", o.maxToolCalls), nil)
 		}
 		if o.pendingCount() >= o.maxPendingCalls {
@@ -994,6 +1070,10 @@ func (o *executionOwner) emitOutput(out Output) *Error {
 		return o.emit(Observation{Kind: ObservationText, Text: out.Text})
 	case "console":
 		return o.emit(Observation{Kind: ObservationConsole, Text: out.Text, Level: out.Level})
+	case "image":
+		// The observer gets its own copy so a mutating observer cannot change
+		// the retained Result.Outputs image bytes.
+		return o.emit(Observation{Kind: ObservationImage, MIME: out.MIME, Data: append([]byte(nil), out.Data...)})
 	}
 	return nil
 }

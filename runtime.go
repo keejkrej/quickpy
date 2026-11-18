@@ -3,7 +3,6 @@ package quickpy
 import (
 	"context"
 	"fmt"
-	"math"
 	"regexp"
 	"sort"
 	"sync"
@@ -214,11 +213,12 @@ func (r *Runtime) Execute(ctx context.Context, req ExecuteRequest) (*Execution, 
 
 	go e.watchParent(ctx)
 	// The public contract treats MaxToolCalls == 0 as "no cap". The low-level
-	// engine treats 0 as its own default, so pass an effectively unbounded
-	// value to preserve the public semantics.
+	// engine uses -1 for unlimited and reserves 0 for its own M0 default, so
+	// map the public zero explicitly instead of forwarding math.MaxInt as a
+	// guest-visible cap.
 	engineMaxToolCalls := resolved.MaxToolCalls
 	if engineMaxToolCalls == 0 {
-		engineMaxToolCalls = math.MaxInt
+		engineMaxToolCalls = -1
 	}
 	go r.runExecution(e, engineRequest{
 		Source:                 req.Source,
@@ -253,6 +253,12 @@ func (r *Runtime) resolveRequest(req ExecuteRequest) (resolvedRequest, error) {
 	}
 	if len(req.Source) > r.opts.MaxSourceBytes {
 		return resolvedRequest{}, invalidRequest("execute", fmt.Sprintf("source exceeds %d bytes", r.opts.MaxSourceBytes))
+	}
+	if len(req.Source) > r.opts.MaxMessageBytes {
+		// The source is part of the start message. Reject an obviously
+		// oversized source before admission; the low-level engine still
+		// enforces the exact encoded message cap.
+		return resolvedRequest{}, invalidRequest("execute", fmt.Sprintf("source exceeds %d bytes", r.opts.MaxMessageBytes))
 	}
 	if req.Timeout < 0 {
 		return resolvedRequest{}, invalidRequest("execute", "Timeout must be >= 0")

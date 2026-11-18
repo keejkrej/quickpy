@@ -7,21 +7,24 @@ repository is being handed over.
 ## 1. Start here
 
 1. Read [`../README.md`](../README.md) for the short orientation.
-2. Read [`M1_STATUS.md`](M1_STATUS.md) for the current M1 increment, integration
-   evidence, and open gates.
+2. Read [`M1_STATUS.md`](M1_STATUS.md) for the accepted M1 evidence, limits, and
+   constraints.
 3. Read [`SPEC.md`](SPEC.md) for the intended contract and milestone criteria.
 4. Read [`../guest/M0_NOTES.md`](../guest/M0_NOTES.md) for historical M0 guest
    build details, pins, the transient ABI, and evidence.
-5. Read [`../guest/M1_NOTES.md`](../guest/M1_NOTES.md) for the M1 guest state
-   slice, ABI 2, and current artifact evidence.
+5. Read [`../guest/M1_NOTES.md`](../guest/M1_NOTES.md) for the M1 guest
+   state/output slice, ABI 4, and current artifact evidence.
 6. Read [`../cmd/quickpy-spike/README.md`](../cmd/quickpy-spike/README.md) for
    the host CLI and the exact evidence commands.
-7. Check the current git state and the M1 branch (see §9).
+7. Check the current git state and the M1 conformance PR (see §9).
+8. Read [`AGENT_TARGET.md`](AGENT_TARGET.md) for the proposed post-M1
+   compiled-agent direction; it is not current scope.
 
-QuickPy is an M0-accepted feasibility baseline plus an in-progress M1 public
-SDK. M1 is not accepted as a full release. It is not a stable public SDK, not
-CPython, and not pi-go integration. The public entry point is the root `quickpy` package
-(`api.go`, `runtime.go`, `execution.go`, `events.go`, `errors.go`, `value.go`).
+QuickPy is an M0-accepted feasibility baseline plus a **full M1-accepted public
+SDK + persistence milestone**. M1 acceptance is a milestone verdict, not
+production GA, a stable 1.0 API, CPython compatibility, or pi-go integration.
+The public entry point is the root `quickpy` package (`api.go`, `runtime.go`,
+`execution.go`, `events.go`, `errors.go`, `value.go`).
 
 ## 2. What exists
 
@@ -31,9 +34,9 @@ CPython, and not pi-go integration. The public entry point is the root `quickpy`
 - **Host:** a Go/wazero adapter in `internal/wasmguest` and a CLI in
   `cmd/quickpy-spike`. The host owns instantiation, tool dispatch, scheduling,
   cancellation, limits, and structured results.
-- **Public SDK (M1, pre-1.0):** the root `quickpy` package wraps the low-level
-  host and owns the public value, event, error, and lifecycle types. It is
-  implemented but not accepted; see [`M1_STATUS.md`](M1_STATUS.md).
+- **Public SDK (M1 accepted, pre-1.0):** the root `quickpy` package wraps the
+  low-level host and owns the public value, event, error, and lifecycle types.
+  It is accepted as an M1 milestone; see [`M1_STATUS.md`](M1_STATUS.md).
 - **Spec:** `docs/SPEC.md` defines the public Go contract, guest protocol, error
   taxonomy, limits, and milestones.
 - **Tests:** synthetic host-adapter fixtures under
@@ -94,33 +97,57 @@ go run ./cmd/quickpy-spike -artifact guest/build/quickpy.wasm -mode sleep0 -json
 
 Expected artifact identity for the current M1 build:
 
-- size: **220,134 bytes**
-- sha256: `be1b8e48b6884e3e9e2a59c758a2abceac564adb5162b691e5a6b6cd3eac9c4d`
-- ABI: **2** (packed 0.2)
-- memory: initial **64 pages / 4 MiB**, maximum 1024 pages / 64 MiB
+- size: **236,119 bytes**
+- sha256: `171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`
+- ABI: **4** (packed 0.4)
+- MicroPython: **1.29.0**
+- protocol envelope: **0**
+- memory: initial **64 pages / 4 MiB**, maximum **1024 pages / 64 MiB**
+- guest heap: **4 MiB**
 - WASI imports: **0**
+- EH tags: **1**
+- exports: unchanged (`memory`, `_initialize`, `qp_abi_version`, `qp_alloc`,
+  `qp_free`, `qp_invoke`)
 
-The M0 artifact identity (195,053 bytes, sha256
+A clean-directory rebuild was byte-identical. The M0 artifact identity (195,053
+bytes, sha256
 `4af0bedc33b11101e88cfc4e42a6e4ae187b0db6f079afa3d6e9baa90c738aca`) is
 historical and stale for M1. If a rebuild produces a different hash, record the
 new hash and treat reproducibility as an open item rather than silently
 updating the number. See [`../guest/M1_NOTES.md`](../guest/M1_NOTES.md).
 
-## 5. Evidence status (M0 historical, M1 in progress)
+## 5. Evidence status (M0 historical, M1 accepted)
 
 **M0:** independent verification returned **GO on all 11 M0 exit criteria**. M0
 is an accepted feasibility baseline, not a production SDK. The M0 numbers below
 are historical and stale for the M1 artifact.
 
-**M1:** in progress and **not accepted as a full release**. The public root
-package, persistence/state, events, lifecycle, and the real-artifact integration
-suite now form a coherent, integration-tested increment. The integration suite
-is worker-reported passing (40 top-level tests plus 14 subtests, ~7.9 s; race
-run ~40.3 s) and skips cleanly when `QUICKPY_TEST_ARTIFACT` is unset.
-Independent verification is being started; until its report lands, treat these
-as worker-reported results, not independent confirmation. See
-[`M1_STATUS.md`](M1_STATUS.md) for the current pieces, open gates, and
-deviations.
+**M1:** **full M1 accepted (independent verification, 2026-11-18).** All 12 M1
+exit criteria in [`SPEC.md`](SPEC.md) §16 pass against the real artifact. The
+public root package, persistence/state, events, lifecycle, structured
+console/image output, tool conformance, and the real-artifact integration suite
+form the accepted milestone. This is not production GA, a stable 1.0 API,
+CPython compatibility, or pi-go integration. See [`M1_STATUS.md`](M1_STATUS.md)
+for the accepted evidence, limits, and constraints.
+
+Verified for M1:
+
+- Artifact: **236,119 bytes**, sha256
+  `171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`,
+  ABI **4**, MicroPython **1.29.0**, protocol envelope **0**, **zero** WASI
+  imports, **1** EH tag, **64/1024** memory pages, **4 MiB** guest heap; a
+  clean-directory rebuild was byte-identical and exports were unchanged.
+- **118/118** guest smoke checks pass; **78/78** instances closed. The smoke
+  RSS observation of ~69–72 MiB after the harness fix is historical and
+  run-specific, not a per-instance guarantee.
+- **72** top-level integration tests plus **74** subtests (~15.4 s; `-race`
+  110.2 s); **58** root tests; **126** internal tests total.
+- Opt-in soak: **1060** executions in **27.84 s**, zero errors, goroutines
+  **2/2**, RSS around **360 MiB** and stable on the reference machine. This is
+  a process-level observation, not a per-instance memory guarantee; see
+  [`../integration/SOAK.md`](../integration/SOAK.md).
+- `gofmt`, `go vet`, `go build`, default tests, and default-race pass; repeat
+  async/lifecycle runs passed **3×**.
 
 Verified for M0 on the development machine:
 
@@ -153,27 +180,24 @@ For current M1 status, use [`M1_STATUS.md`](M1_STATUS.md) and
 status, but do not treat a stale “pending” line as a new blocker without
 re-running the evidence.
 
-## 6. Immediate next steps for a new agent (M1 in progress)
+## 6. Immediate next steps for a new agent (post-M1)
 
-1. Read [`M1_STATUS.md`](M1_STATUS.md). M1 is **not accepted as a full
-   release**; the branch `m1/public-sdk` is local and uncommitted at the time of
-   writing (see §9). Packaging will add the real current PR pointer later.
+1. Confirm the M1 conformance PR is merged and `main` contains the accepted M1
+   source (see §9).
 2. Run the clean-clone build and verification commands in §4, including the
-   gated integration suite, to confirm the current artifact on the new machine.
-3. Finish the remaining **M1 acceptance gates** from the current state. Do not
-   rewrite the public shell or the state model; they are the increment under
-   test.
-   - Cover the request-specific caps that are not yet exercised with the real
-     artifact (`MaxSourceBytes`, `MaxToolCalls`, `MaxPendingCalls`,
-     `MaxResumes`, tool-result caps), and add real protocol/guest-fault cases.
-   - Add a normative supported `asyncio` subset and failure matrix.
-   - Add a dedicated soak/resource-leak trend; the basic close scenarios are
-     already covered by the integration suite.
-   - Resolve or explicitly accept the deviations listed in `M1_STATUS.md`
-     (blank `GuestInfo.Version`, unpopulated `ToolCause`, console/image output,
-     event streaming during long-running guest code).
-4. Keep the M0 evidence reproducible; do not regress the accepted baseline.
-5. Only after M1/M2 should pi-go integration begin.
+   gated integration suite and the opt-in soak, to confirm the artifact on the
+   new machine.
+3. Start **post-M1 corpus packaging** per
+   [`AGENT_TARGET.md`](AGENT_TARGET.md):
+   - define the acceptance corpus and the supported module facade;
+   - build the separate Go agent application composing `pi-go/agent`, selected
+     `pi-go/ai` provider code, and the QuickPy SDK;
+   - keep **CodeMode** default-deny and **AgentScript** opt-in;
+   - do not rewrite the engine or add unbounded wrappers.
+4. Keep the M0/M1 evidence reproducible; do not regress the accepted baselines.
+5. Stable artifact distribution/embedding remains future packaging work.
+6. Only after the post-M1 corpus and M2 hardening should pi-go integration be
+   treated as shipped.
 
 ## 7. Known hard requirements and limitations
 
@@ -203,24 +227,25 @@ re-running the evidence.
   not per instance (wazero API limitation). A per-execution
   `ExecuteRequest.MaxMemoryBytes` must be zero (inherit) or exactly equal to the
   runtime value; a tighter value is rejected with `InvalidRequest`, not silently
-  ignored.
+  ignored. A configured cap hit during guest allocation is a guest-visible
+  `MemoryError`/`ScriptError`, not `LimitExceeded`; see
+  [ADR-0001](adr/0001-guest-allocation-failures.md).
 - **Timers:** positive `asyncio.sleep` and `time.sleep` raise a catchable
   `UnsupportedError`. Only `asyncio.sleep(0)` is a supported yield.
-- **M1 deviations:** `GuestInfo.Version` is blank; an uncaught structured
-  `ToolCause` is not populated; `ConsoleEvent`/`ImageEvent` are exposed but the
-  real guest does not emit console or image output yet; event streaming happens
-  when a guest invocation returns, not during a long-running yield-free
-  C/Python section.
-- **Open M1 gates:** request-specific `MaxSourceBytes`, `MaxToolCalls`,
-  `MaxPendingCalls`, `MaxResumes`, and tool-result caps are not all covered with
-  the real artifact (synthetic tests cover some); real protocol/guest-fault
-  coverage is synthetic; no host wall-clock timers or top-level
-  `await`/`return`; no stable artifact distribution/embedding contract; no
-  pi-go integration; a complete normative `asyncio` subset/failure matrix and a
-  dedicated soak/resource-leak trend are still needed.
+- **Output timing:** output is observed when a guest invocation returns, not
+  streamed during a long-running yield-free C/Python section.
+- **Accepted constraints:** no host wall-clock timers; no top-level
+  `await`/`return`; narrow MicroPython module surface; per-execution memory
+  below the runtime cap is rejected; no OS process isolation; tool
+  implementations are trusted.
+- **Post-M1 work (not M1 conformance gates):** stable artifact
+  distribution/embedding, the proposed [`AGENT_TARGET.md`](AGENT_TARGET.md)
+  corpus/agent application, OS wrappers as future `AgentScript` default-deny
+  work, and pi-go integration.
 - **M1 memory numbers:** the current guest uses a 4 MiB heap and 4 MiB initial
-  linear memory. Do not reuse M0 startup/RSS measurements for M1; new M1 memory
-  measurements are not yet recorded here.
+  linear memory. See [`../guest/M1_NOTES.md`](../guest/M1_NOTES.md) and
+  [`../integration/SOAK.md`](../integration/SOAK.md). Do not reuse M0
+  startup/RSS measurements for M1.
 - **Unstable protocol/API:** the guest protocol and Go API are pre-1.0 and may
   change.
 
@@ -253,20 +278,27 @@ and no longer current**. The M0 handoff is complete:
 - `main` now contains the M0 source; the base is no longer unborn and the M0
   status-doc workers are no longer pending.
 
-Current M1 work:
+M1 history:
 
-- Branch: `m1/public-sdk`, based on `main` at `1100618` (the M0 merge).
-- Independent verification returned **GO on 2026-11-18**: the real artifact
-  rebuilt byte-identically, the default and race suites passed, the
-  real-artifact integration suite passed three repeat runs, and guest smoke
-  passed 66/66. No blocking issues were reported.
-- The increment is published as PR **#2**:
-  <https://github.com/keejkrej/quickpy/pull/2> (base `main`, head
-  `m1/public-sdk`). At the time of this amendment the PR is open and pending
-  merge; use `gh pr view 2 --json state,mergeCommit` to resolve the final merge
+- PR **#2** (`m1/public-sdk`) delivered the public SDK + persistence increment
+  and was merged into `main` at `459e9642055380e4d8e946d6c06418c91eed89ae`.
+  That PR was an increment, not full M1 acceptance.
+
+Current M1 conformance work:
+
+- Branch: `m1/conformance`, based on `main` at `459e964` (the PR #2 merge).
+- Independent verification returned **GO on all 12 M1 exit criteria** on
+  **2026-11-18**: the real artifact rebuilt byte-identically, the default and
+  race suites passed, the real-artifact integration suite passed, guest smoke
+  passed 118/118 with 78/78 instances closed, and the opt-in soak passed. No
+  blocking issues were reported.
+- The increment is published as PR **#3**:
+  <https://github.com/keejkrej/quickpy/pull/3> (base `main`, head
+  `m1/conformance`). At the time of this amendment the PR is open and pending
+  merge; use `gh pr view 3 --json state,mergeCommit` to resolve the final merge
   result.
-- It is **not a full M1 acceptance or release**. Do not describe M1 as merged or
-  accepted until the PR is merged.
+- This is **full M1 acceptance as a milestone**, not production GA, a stable
+  1.0 API, CPython compatibility, or full Prime compatibility.
 
 Staging must use explicit paths, never `git add -A`. Exclude `guest/build/`,
 `guest/.cache/`, logs, temp files, and local binaries. The synthetic

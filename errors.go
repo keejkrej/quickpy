@@ -63,10 +63,14 @@ type ScriptErrorInfo struct {
 }
 
 // ToolCause describes an uncaught tool failure that ended a script.
+//
+// CallID is an opaque diagnostic identifier. It is empty when the guest did
+// not report one and must not be used to resume or correlate calls.
 type ToolCause struct {
 	Tool    string
 	Code    string
 	Message string
+	CallID  string
 }
 
 // ErrWaitTimeout is returned by Wait when only the wait context expires. It

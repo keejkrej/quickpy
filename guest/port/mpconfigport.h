@@ -39,6 +39,10 @@
 #define MICROPY_PY_OS (0)
 #define MICROPY_PY_THREAD (0)
 
+// quickpy.image() accepts bytes or bytearray.  The minimum ROM level omits
+// bytearray, so enable just that builtin; no array/memoryview surface is added.
+#define MICROPY_PY_BUILTINS_BYTEARRAY (1)
+
 // M0 async experiment: stock _asyncio Task/TaskQueue, frozen asyncio package,
 // built-in json for tool argument/result values, and time only so that
 // time.sleep can be patched to raise UnsupportedError.

@@ -1,12 +1,13 @@
 package wasmguest
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
 
 func TestDecodeCompleted(t *testing.T) {
-	data := []byte(`{"v":0,"type":"completed","outputs":[{"type":"text","text":"hello"},{"type":"console","level":"warn","text":"careful"}]}`)
+	data := []byte(`{"v":0,"type":"completed","outputs":[{"type":"text","text":"hello"},{"type":"console","level":"warn","text":"careful"},{"type":"image","mime":"image/png","data_base64":"AAECAwT/"}]}`)
 	resp, err := decodeResponse(data)
 	if err != nil {
 		t.Fatalf("decodeResponse: %v", err)
@@ -14,11 +15,14 @@ func TestDecodeCompleted(t *testing.T) {
 	if resp.Type != "completed" {
 		t.Fatalf("type = %q", resp.Type)
 	}
-	if len(resp.Outputs) != 2 {
+	if len(resp.Outputs) != 3 {
 		t.Fatalf("outputs = %d", len(resp.Outputs))
 	}
 	if resp.Outputs[0].Text != "hello" || resp.Outputs[1].Level != "warn" {
 		t.Fatalf("unexpected outputs: %+v", resp.Outputs)
+	}
+	if resp.Outputs[2].MIME != "image/png" || !bytes.Equal(resp.Outputs[2].Data, []byte{0, 1, 2, 3, 4, 0xff}) {
+		t.Fatalf("image output = %+v", resp.Outputs[2])
 	}
 	if len(resp.UnknownFields) != 0 {
 		t.Fatalf("unknown fields = %v", resp.UnknownFields)
@@ -36,6 +40,77 @@ func TestDecodeFailed(t *testing.T) {
 	}
 	if resp.Exception == nil || resp.Exception.Type != "ValueError" || resp.Exception.Line != 3 {
 		t.Fatalf("exception = %+v", resp.Exception)
+	}
+	if resp.Exception.ToolCause != nil {
+		t.Fatalf("tool cause = %+v, want nil", resp.Exception.ToolCause)
+	}
+}
+
+func TestDecodeEngineMetadata(t *testing.T) {
+	data := []byte(`{"v":0,"type":"completed","engine_name":"micropython","engine_version":"1.29.0"}`)
+	resp, err := decodeResponse(data)
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if resp.EngineName != "micropython" || resp.EngineVersion != "1.29.0" {
+		t.Fatalf("engine metadata = %q %q", resp.EngineName, resp.EngineVersion)
+	}
+	if len(resp.UnknownFields) != 0 {
+		t.Fatalf("unknown fields = %v", resp.UnknownFields)
+	}
+}
+
+func TestDecodeToolCause(t *testing.T) {
+	data := []byte(`{"v":0,"type":"failed","error":{"type":"ToolError","message":"tool failed","tool_cause":{"code":"permission_denied","message":"no","tool":"search","call_id":7}}}`)
+	resp, err := decodeResponse(data)
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	tc := resp.Exception.ToolCause
+	if tc == nil {
+		t.Fatal("ToolCause = nil")
+	}
+	if tc.Code != "permission_denied" || tc.Message != "no" || tc.Tool != "search" {
+		t.Fatalf("ToolCause = %+v", tc)
+	}
+	if tc.CallID == nil || *tc.CallID != 7 {
+		t.Fatalf("CallID = %v", tc.CallID)
+	}
+}
+
+func TestDecodeToolCauseOptionalFields(t *testing.T) {
+	data := []byte(`{"v":0,"type":"failed","error":{"type":"ToolError","tool_cause":{"code":"tool_error","message":"boom"}}}`)
+	resp, err := decodeResponse(data)
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	tc := resp.Exception.ToolCause
+	if tc == nil || tc.Code != "tool_error" || tc.Message != "boom" {
+		t.Fatalf("ToolCause = %+v", tc)
+	}
+	if tc.Tool != "" || tc.CallID != nil {
+		t.Fatalf("optional fields = %+v", tc)
+	}
+}
+
+func TestDecodeToolCauseRejectsMissingCode(t *testing.T) {
+	_, err := decodeResponse([]byte(`{"v":0,"type":"failed","error":{"type":"ToolError","tool_cause":{"message":"boom"}}}`))
+	if err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeToolCauseRejectsMissingMessage(t *testing.T) {
+	_, err := decodeResponse([]byte(`{"v":0,"type":"failed","error":{"type":"ToolError","tool_cause":{"code":"x"}}}`))
+	if err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeToolCauseRejectsBadCallID(t *testing.T) {
+	_, err := decodeResponse([]byte(`{"v":0,"type":"failed","error":{"type":"ToolError","tool_cause":{"code":"x","call_id":0}}}`))
+	if err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -73,8 +148,193 @@ func TestDecodeOutputTruncated(t *testing.T) {
 	}
 }
 
-func TestDecodeRejectsBothOutputForms(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":"a","outputs":[{"type":"text","text":"b"}]}`))
+func TestDecodePrefersOutputsOverLegacy(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":"legacy","outputs":[{"type":"text","text":"structured"}]}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if len(resp.Outputs) != 1 || resp.Outputs[0].Text != "structured" {
+		t.Fatalf("outputs = %+v", resp.Outputs)
+	}
+}
+
+func TestDecodeEmptyOutputsArrayIgnoresLegacy(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":"legacy","outputs":[]}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if len(resp.Outputs) != 0 {
+		t.Fatalf("outputs = %+v", resp.Outputs)
+	}
+}
+
+func TestDecodeNullOutputsFallsBackToLegacy(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":"legacy","outputs":null}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if len(resp.Outputs) != 1 || resp.Outputs[0].Text != "legacy" {
+		t.Fatalf("outputs = %+v", resp.Outputs)
+	}
+}
+
+func TestDecodeMissingOutputsFallsBackToLegacy(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":"legacy"}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if len(resp.Outputs) != 1 || resp.Outputs[0].Text != "legacy" {
+		t.Fatalf("outputs = %+v", resp.Outputs)
+	}
+}
+
+func TestDecodeMissingOutputsAndLegacyIsEmpty(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed"}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if len(resp.Outputs) != 0 {
+		t.Fatalf("outputs = %+v", resp.Outputs)
+	}
+}
+
+func TestDecodeConsoleLevels(t *testing.T) {
+	for _, level := range []string{"debug", "info", "warn", "error"} {
+		data := []byte(`{"v":0,"type":"completed","outputs":[{"type":"console","level":"` + level + `","text":"x"}]}`)
+		resp, err := decodeResponse(data)
+		if err != nil {
+			t.Fatalf("level %q: %v", level, err)
+		}
+		if len(resp.Outputs) != 1 || resp.Outputs[0].Level != level {
+			t.Fatalf("level %q: outputs = %+v", level, resp.Outputs)
+		}
+	}
+}
+
+func TestDecodeRejectsInvalidConsoleLevel(t *testing.T) {
+	cases := []string{
+		`{"v":0,"type":"completed","outputs":[{"type":"console","text":"x"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"console","level":"trace","text":"x"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"console","level":null,"text":"x"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"console","level":1,"text":"x"}]}`,
+	}
+	for _, data := range cases {
+		if _, err := decodeResponse([]byte(data)); err == nil || err.Kind != KindProtocolError {
+			t.Fatalf("expected protocol error for %s, got %v", data, err)
+		}
+	}
+}
+
+func TestDecodeImageBinaryFidelity(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"application/octet-stream","data_base64":"AAECf4D/"}]}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	want := []byte{0x00, 0x01, 0x02, 0x7f, 0x80, 0xff}
+	if len(resp.Outputs) != 1 || !bytes.Equal(resp.Outputs[0].Data, want) {
+		t.Fatalf("image data = %v, want %v", resp.Outputs[0].Data, want)
+	}
+}
+
+func TestDecodeRejectsInvalidBase64(t *testing.T) {
+	cases := []string{
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png","data_base64":"!!!!"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png","data_base64":"A"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png","data_base64":null}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png"}]}`,
+	}
+	for _, data := range cases {
+		if _, err := decodeResponse([]byte(data)); err == nil || err.Kind != KindProtocolError {
+			t.Fatalf("expected protocol error for %s, got %v", data, err)
+		}
+	}
+}
+
+func TestDecodeRejectsInvalidMIME(t *testing.T) {
+	cases := []string{
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"","data_base64":"AQID"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"png","data_base64":"AQID"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/","data_base64":"AQID"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"/png","data_base64":"AQID"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png; charset=x","data_base64":"AQID"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/p ng","data_base64":"AQID"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":null,"data_base64":"AQID"}]}`,
+	}
+	for _, data := range cases {
+		if _, err := decodeResponse([]byte(data)); err == nil || err.Kind != KindProtocolError {
+			t.Fatalf("expected protocol error for %s, got %v", data, err)
+		}
+	}
+}
+
+func TestDecodeRejectsInvalidUTF8(t *testing.T) {
+	data := []byte("{\"v\":0,\"type\":\"completed\",\"outputs\":[{\"type\":\"text\",\"text\":\"bad\xff\"}]}")
+	if _, err := decodeResponse(data); err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeRejectsUnpairedSurrogate(t *testing.T) {
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"text","text":"\ud800"}]}`))
+	if err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeRejectsImageOverMessageBound(t *testing.T) {
+	// 6 decoded bytes, message-derived allocation bound 5.
+	_, err := decodeResponseWithMessageLimit([]byte(`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png","data_base64":"AAECAwT/"}]}`), 5)
+	if err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeAllowsImageAtMessageBound(t *testing.T) {
+	resp, err := decodeResponseWithMessageLimit([]byte(`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png","data_base64":"AAECAwT/"}]}`), 6)
+	if err != nil {
+		t.Fatalf("decodeResponseWithMessageLimit: %v", err)
+	}
+	if len(resp.Outputs) != 1 || len(resp.Outputs[0].Data) != 6 {
+		t.Fatalf("outputs = %+v", resp.Outputs)
+	}
+}
+
+func TestDecodeAcceptsImageLargerThanOutputCap(t *testing.T) {
+	// The decoder has no public output cap. A valid image is decoded here and
+	// clipped later by the execution owner's cumulative accounting.
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png","data_base64":"AAECAwQFBgcICQoLDA0ODxAREhM="}]}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if len(resp.Outputs) != 1 || len(resp.Outputs[0].Data) != 20 {
+		t.Fatalf("outputs = %+v", resp.Outputs)
+	}
+}
+
+func TestDecodeRejectsNonStringOutputFields(t *testing.T) {
+	cases := []string{
+		`{"v":0,"type":"completed","outputs":[{"type":"text","text":1}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"console","level":"info","text":1}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":1,"data_base64":"AQID"}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":"image","mime":"image/png","data_base64":1}]}`,
+		`{"v":0,"type":"completed","outputs":[{"type":1}]}`,
+	}
+	for _, data := range cases {
+		if _, err := decodeResponse([]byte(data)); err == nil || err.Kind != KindProtocolError {
+			t.Fatalf("expected protocol error for %s, got %v", data, err)
+		}
+	}
+}
+
+func TestDecodeRejectsOutputsNotArray(t *testing.T) {
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":"nope"}`))
+	if err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeRejectsLegacyOutputNotString(t *testing.T) {
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":1}`))
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
@@ -125,7 +385,7 @@ func TestDecodeRejectsWrongType(t *testing.T) {
 }
 
 func TestDecodeRejectsUnknownOutputType(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"image","text":"x"}]}`))
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"video","text":"x"}]}`))
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}

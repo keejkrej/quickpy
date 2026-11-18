@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"unicode/utf8"
 )
 
 var errExecutionCancelled = errors.New("quickpy: execution cancelled")
@@ -91,7 +92,7 @@ func (e *Execution) terminal() (Result, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	res := e.result
-	res.Outputs = append([]Event(nil), e.result.Outputs...)
+	res.Outputs = cloneEvents(e.result.Outputs)
 	return res, e.err
 }
 
@@ -137,7 +138,7 @@ func (e *Execution) appendText(text, level string) {
 			return
 		}
 		if len(text) > remaining {
-			text = text[:remaining]
+			text = clipUTF8(text, remaining)
 			e.outputBytes = e.maxOutputBytes
 			e.latchLimit("output limit exceeded")
 		} else {
@@ -199,7 +200,7 @@ func (e *Execution) deliver(ev Event) {
 func (e *Execution) finish(res engineResult, err error) {
 	e.obsMu.Lock()
 	e.obsDone = true
-	outputs := append([]Event(nil), e.outputs...)
+	outputs := cloneEvents(e.outputs)
 	latched := e.latched
 	e.obsMu.Unlock()
 
@@ -263,4 +264,38 @@ func (e *Execution) finish(res engineResult, err error) {
 	e.runtime.removeActive(e)
 	e.mu.Unlock()
 	close(e.done)
+}
+
+// cloneEvents copies the event slice and deep-copies image bytes so a caller
+// cannot mutate the execution's retained result through an ImageEvent.Data
+// alias.
+func cloneEvents(events []Event) []Event {
+	if events == nil {
+		return nil
+	}
+	out := make([]Event, len(events))
+	for i, ev := range events {
+		if img, ok := ev.(ImageEvent); ok {
+			img.Data = append([]byte(nil), img.Data...)
+			out[i] = img
+			continue
+		}
+		out[i] = ev
+	}
+	return out
+}
+
+// clipUTF8 returns the longest prefix of s that is at most max bytes and ends
+// on a UTF-8 rune boundary.
+func clipUTF8(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
