@@ -7,7 +7,7 @@ import (
 
 func TestDecodeCompleted(t *testing.T) {
 	data := []byte(`{"v":0,"type":"completed","outputs":[{"type":"text","text":"hello"},{"type":"console","level":"warn","text":"careful"}]}`)
-	resp, err := decodeResponse(data, 1024)
+	resp, err := decodeResponse(data)
 	if err != nil {
 		t.Fatalf("decodeResponse: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestDecodeCompleted(t *testing.T) {
 
 func TestDecodeFailed(t *testing.T) {
 	data := []byte(`{"v":0,"type":"failed","error":{"type":"ValueError","message":"boom","traceback":"tb","filename":"main.py","line":3}}`)
-	resp, err := decodeResponse(data, 1024)
+	resp, err := decodeResponse(data)
 	if err != nil {
 		t.Fatalf("decodeResponse: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestDecodeFailed(t *testing.T) {
 
 func TestDecodeUnknownFields(t *testing.T) {
 	data := []byte(`{"v":0,"type":"completed","future":true,"outputs":[{"type":"text","text":"x","extra":1}],"error":null}`)
-	resp, err := decodeResponse(data, 1024)
+	resp, err := decodeResponse(data)
 	if err != nil {
 		t.Fatalf("decodeResponse: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestDecodeUnknownFields(t *testing.T) {
 
 func TestDecodeOutputString(t *testing.T) {
 	data := []byte(`{"v":0,"type":"completed","output":"hello"}`)
-	resp, err := decodeResponse(data, 1024)
+	resp, err := decodeResponse(data)
 	if err != nil {
 		t.Fatalf("decodeResponse: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestDecodeOutputString(t *testing.T) {
 
 func TestDecodeOutputTruncated(t *testing.T) {
 	data := []byte(`{"v":0,"type":"completed","output":"hello","output_truncated":true}`)
-	resp, err := decodeResponse(data, 1024)
+	resp, err := decodeResponse(data)
 	if err != nil {
 		t.Fatalf("decodeResponse: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestDecodeOutputTruncated(t *testing.T) {
 }
 
 func TestDecodeRejectsBothOutputForms(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":"a","outputs":[{"type":"text","text":"b"}]}`), 1024)
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":"a","outputs":[{"type":"text","text":"b"}]}`))
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
@@ -82,14 +82,14 @@ func TestDecodeRejectsBothOutputForms(t *testing.T) {
 
 func TestDecodeRejectsDeepNesting(t *testing.T) {
 	data := []byte(`{"v":0,"type":"completed","outputs":` + strings.Repeat("[", 300) + strings.Repeat("]", 300) + `}`)
-	_, err := decodeResponse(data, 1024)
+	_, err := decodeResponse(data)
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
 }
 
 func TestDecodeRejectsStalledOnCompleted(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","stalled":true}`), 1024)
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","stalled":true}`))
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
@@ -104,56 +104,140 @@ func TestDecodeRejectsMalformed(t *testing.T) {
 		[]byte(`{"v":0,"type":"completed"} trailing`),
 	}
 	for _, data := range cases {
-		if _, err := decodeResponse(data, 1024); err == nil {
+		if _, err := decodeResponse(data); err == nil {
 			t.Fatalf("expected error for %q", data)
 		}
 	}
 }
 
 func TestDecodeRejectsWrongVersion(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":1,"type":"completed"}`), 1024)
+	_, err := decodeResponse([]byte(`{"v":1,"type":"completed"}`))
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
 }
 
 func TestDecodeRejectsWrongType(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":0,"type":"started"}`), 1024)
+	_, err := decodeResponse([]byte(`{"v":0,"type":"started"}`))
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
 }
 
 func TestDecodeRejectsUnknownOutputType(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"image","text":"x"}]}`), 1024)
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"image","text":"x"}]}`))
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
 }
 
 func TestDecodeRejectsDuplicateKeys(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":0,"v":0,"type":"completed"}`), 1024)
+	_, err := decodeResponse([]byte(`{"v":0,"v":0,"type":"completed"}`))
 	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
 }
 
-func TestDecodeRejectsOversizedOutput(t *testing.T) {
-	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"text","text":"0123456789"}]}`), 4)
-	if err == nil || err.Kind != KindLimitExceeded {
+func TestDecodeAllowsOversizedOutputForOwnerClipping(t *testing.T) {
+	// Output size is enforced cumulatively by the execution owner so the
+	// retained prefix and observer stream are clipped consistently. The
+	// decoder only validates the message shape.
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","outputs":[{"type":"text","text":"0123456789"}]}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if len(resp.Outputs) != 1 || resp.Outputs[0].Text != "0123456789" {
+		t.Fatalf("outputs = %+v", resp.Outputs)
+	}
+}
+
+func TestDecodeStateFields(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","state_written":true,"state":{"a":1}}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if !resp.StateWritten || !resp.StatePresent {
+		t.Fatalf("state flags = written:%v present:%v", resp.StateWritten, resp.StatePresent)
+	}
+	if string(resp.StateRaw) != `{"a":1}` {
+		t.Fatalf("state raw = %s", resp.StateRaw)
+	}
+}
+
+func TestDecodeStateNull(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","state_written":true,"state":null}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if !resp.StateWritten || !resp.StatePresent {
+		t.Fatalf("state flags = written:%v present:%v", resp.StateWritten, resp.StatePresent)
+	}
+	if string(resp.StateRaw) != "null" {
+		t.Fatalf("state raw = %s", resp.StateRaw)
+	}
+}
+
+func TestDecodeStateOmittedNoWrite(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed"}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if resp.StateWritten || resp.StatePresent {
+		t.Fatalf("state flags = written:%v present:%v", resp.StateWritten, resp.StatePresent)
+	}
+}
+
+func TestDecodeStateWrittenMissingStateRejected(t *testing.T) {
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","state_written":true}`))
+	if err == nil || err.Kind != KindProtocolError {
 		t.Fatalf("err = %v", err)
 	}
 }
 
-func TestDecodeRejectsCompletedWithError(t *testing.T) {
-	// decodeResponse itself accepts the shape; Execute rejects it. This test
-	// documents that the decoder is tolerant and the semantic check is separate.
-	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","error":{"type":"Error","message":"x"}}`), 1024)
+func TestDecodeStateOnNonCompletedIgnored(t *testing.T) {
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"failed","state_written":true,"state":{"a":1},"error":{"type":"ValueError","message":"x"}}`))
 	if err != nil {
 		t.Fatalf("decodeResponse: %v", err)
 	}
-	if resp.Exception == nil {
-		t.Fatal("expected exception to be decoded")
+	if resp.StateWritten || resp.StatePresent {
+		t.Fatalf("state flags = written:%v present:%v", resp.StateWritten, resp.StatePresent)
+	}
+}
+
+func TestDecodeRejectsCompletedWithError(t *testing.T) {
+	// A completed response is a success and must never carry error details.
+	_, err := decodeResponse([]byte(`{"v":0,"type":"completed","error":{"type":"Error","message":"x"}}`))
+	if err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeRejectsRealShapedCompletedWithError(t *testing.T) {
+	// A real-shaped completed response that also carries output, state, and an
+	// error object must be rejected rather than surfaced as a successful
+	// completion with committed state.
+	data := []byte(`{"v":0,"type":"completed","output":"done","state_written":true,"state":null,"error":{"type":"ValueError","message":"boom","traceback":"tb","filename":"main.py","line":3}}`)
+	_, err := decodeResponse(data)
+	if err == nil || err.Kind != KindProtocolError {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeAcceptsCompletedStateNullNoError(t *testing.T) {
+	// The legitimate success shape: output plus an explicit null state and no
+	// error object is accepted and remains committable.
+	resp, err := decodeResponse([]byte(`{"v":0,"type":"completed","output":"done","state_written":true,"state":null}`))
+	if err != nil {
+		t.Fatalf("decodeResponse: %v", err)
+	}
+	if resp.Type != "completed" || !resp.StateWritten || !resp.StatePresent {
+		t.Fatalf("resp = %+v", resp)
+	}
+	if resp.Exception != nil {
+		t.Fatalf("exception = %+v", resp.Exception)
+	}
+	if string(resp.StateRaw) != "null" {
+		t.Fatalf("state raw = %s", resp.StateRaw)
 	}
 }
 

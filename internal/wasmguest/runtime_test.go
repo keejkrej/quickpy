@@ -50,8 +50,11 @@ func TestExecuteCompleted(t *testing.T) {
 	if a.InstanceID == b.InstanceID {
 		t.Fatalf("instance IDs reused: %q", a.InstanceID)
 	}
-	if a.Guest.ABIVersion != 1 {
+	if a.Guest.ABIVersion != 2 {
 		t.Fatalf("ABI version = %d", a.Guest.ABIVersion)
+	}
+	if a.StateWritten || a.State != nil {
+		t.Fatalf("state committed without a write: written=%v state=%#v", a.StateWritten, a.State)
 	}
 	if a.MemoryPages == 0 {
 		t.Fatal("memory pages = 0")
@@ -205,8 +208,26 @@ func TestABIVersionMismatch(t *testing.T) {
 	if !ok || we.Kind != KindProtocolError {
 		t.Fatalf("error = %v", err)
 	}
-	if !strings.Contains(we.Message, "ABI version") {
+	if !strings.Contains(we.Message, "unsupported ABI version 3") {
 		t.Fatalf("message = %q", we.Message)
+	}
+}
+
+func TestABIOldVersionRejected(t *testing.T) {
+	rt := newTestRuntime(t, "oldversion.wasm")
+	res, err := rt.Execute(context.Background(), Request{Source: "pass", Filename: "main.py"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindProtocolError {
+		t.Fatalf("error = %v", err)
+	}
+	if !strings.Contains(we.Message, "unsupported ABI version 1") {
+		t.Fatalf("message = %q", we.Message)
+	}
+	if res == nil || res.Guest.ABIVersion != 1 {
+		t.Fatalf("result = %+v", res)
 	}
 }
 

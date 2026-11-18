@@ -37,6 +37,11 @@ type response struct {
 		Message   string `json:"message"`
 		Traceback string `json:"traceback"`
 	} `json:"error"`
+	// StateWritten is a pointer so the harness can distinguish an absent
+	// field (failed/suspended responses) from an explicit false (completed
+	// with no set_state call).
+	StateWritten *bool           `json:"state_written"`
+	State        json.RawMessage `json:"state"`
 }
 
 type instance struct {
@@ -109,6 +114,34 @@ func startRequest(source string) string {
 		"filename": "<smoke>",
 	})
 	return string(b)
+}
+
+func startRequestWithState(source string, initial any) string {
+	b, _ := json.Marshal(map[string]any{
+		"v":             0,
+		"type":          "start",
+		"source":        source,
+		"filename":      "<smoke>",
+		"initial_state": initial,
+	})
+	return string(b)
+}
+
+func decodeState(res response) (any, bool) {
+	if res.State == nil {
+		return nil, false
+	}
+	var v any
+	if err := json.Unmarshal(res.State, &v); err != nil {
+		return nil, false
+	}
+	return v, true
+}
+
+func jsonEqual(a, b any) bool {
+	ab, errA := json.Marshal(a)
+	bb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(ab) == string(bb)
 }
 
 func toolResponses(responses []map[string]any, gc bool) string {
@@ -194,7 +227,9 @@ func main() {
 	}
 
 	ver, err := a.mod.ExportedFunction("qp_abi_version").Call(ctx)
-	check("abi version", err == nil && uint32(ver[0]) == 1, fmt.Sprintf("err=%v value=%v", err, ver))
+	check("abi version", err == nil && uint32(ver[0]) == 2, fmt.Sprintf("err=%v value=%v", err, ver))
+	check("abi version rejects legacy 0.1", err == nil && uint32(ver[0]) != 1,
+		fmt.Sprintf("err=%v value=%v", err, ver))
 
 	fresh := func() *instance {
 		i, err := newInstance(ctx, r, wasm)
@@ -513,6 +548,439 @@ quickpy.run(main())`))
 			err == nil && res.Type == "completed",
 			fmt.Sprintf("err=%v response=%+v", err, res))
 	}
+
+	// ---------------------------------------------------------------------
+	// M1 explicit state tests.
+	// ---------------------------------------------------------------------
+
+	// No set_state call: completed must say state_written=false and omit state.
+	noWrite, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate no-write state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = noWrite.invokeJSON(ctx, startRequest(`print("plain")`))
+	check("state no write completed",
+		err == nil && res.Type == "completed" && res.Output == "plain\n" &&
+			res.StateWritten != nil && !*res.StateWritten && res.State == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// initial_state is copied into the fresh instance and get_state() returns
+	// a deep copy, so mutating the returned value does not change state.
+	initial, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate initial state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = initial.invokeJSON(ctx, startRequestWithState(`import quickpy
+s = quickpy.get_state()
+print(s["a"], s["b"], s["c"], s["d"], s["e"])
+s["a"].append(3)
+print(quickpy.get_state()["a"])`, map[string]any{
+		"a": []any{1, 2},
+		"b": nil,
+		"c": true,
+		"d": 1.5,
+		"e": "héllo",
+	}))
+	check("state initial get",
+		err == nil && res.Type == "completed" &&
+			res.Output == "[1, 2] None True 1.5 héllo\n[1, 2]\n" &&
+			res.StateWritten != nil && !*res.StateWritten && res.State == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// set_state(None) is a write; no set_state is not.
+	setNone, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate set-none state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = setNone.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state(None)`))
+	check("state explicit none",
+		err == nil && res.Type == "completed" &&
+			res.StateWritten != nil && *res.StateWritten && string(res.State) == "null",
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Last successful set_state before completion wins.
+	lastWrite, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate last-write state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = lastWrite.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state(1)
+quickpy.set_state({"n": 2, "b": True, "z": None})`))
+	stateVal, stateOK := decodeState(res)
+	check("state last write wins",
+		err == nil && res.Type == "completed" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK &&
+			jsonEqual(stateVal, map[string]any{"n": float64(2), "b": true, "z": nil}),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// A failed run must not offer committable state.
+	failedState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate failed state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = failedState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state({"n": 1})
+raise ValueError("no commit")`))
+	check("state failed run not committable",
+		err == nil && res.Type == "failed" && res.Error != nil &&
+			res.Error.Type == "ValueError" &&
+			res.StateWritten == nil && res.State == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// State survives partial async resumes and forced GC; suspended responses
+	// never stream a premature state write.
+	asyncState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate async state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = asyncState.invokeJSON(ctx, startRequestWithState(`import asyncio, quickpy
+
+async def main():
+    quickpy.set_state({"phase": 1})
+    await quickpy.tools.a(value=1)
+    quickpy.set_state({"phase": 2})
+    print("mid", quickpy.get_state()["phase"])
+    await quickpy.tools.b(value=2)
+    quickpy.set_state({"phase": 3})
+
+quickpy.run(main())`, map[string]any{"phase": 0}))
+	check("state async first suspend no state",
+		err == nil && res.Type == "suspended" &&
+			res.StateWritten == nil && res.State == nil && len(res.Calls) == 1,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	if len(res.Calls) == 1 {
+		res, err = asyncState.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": res.Calls[0].ID, "ok": true, "value": "A"},
+		}, true))
+		check("state async mid suspend no state",
+			err == nil && res.Type == "suspended" &&
+				res.StateWritten == nil && res.State == nil && len(res.Calls) == 1 &&
+				strings.Contains(res.Output, "mid 2\n"),
+			fmt.Sprintf("err=%v response=%+v", err, res))
+		if len(res.Calls) == 1 {
+			res, err = asyncState.invokeJSON(ctx, toolResponses([]map[string]any{
+				{"id": res.Calls[0].ID, "ok": true, "value": "B"},
+			}, true))
+			stateVal, stateOK = decodeState(res)
+			check("state async final committed",
+				err == nil && res.Type == "completed" &&
+					res.StateWritten != nil && *res.StateWritten && stateOK &&
+					jsonEqual(stateVal, map[string]any{"phase": float64(3)}),
+				fmt.Sprintf("err=%v response=%+v", err, res))
+		}
+	}
+
+	// set_state takes a snapshot; later mutation of the caller's object and
+	// mutation of get_state()'s return value do not change stored state.
+	deepCopy, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate deep-copy state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = deepCopy.invokeJSON(ctx, startRequest(`import quickpy
+v = [1]
+quickpy.set_state(v)
+v.append(2)
+print("snapshot", quickpy.get_state())
+s = quickpy.get_state()
+s.append(3)
+print("copy", quickpy.get_state())
+d = {"a": [1]}
+quickpy.set_state(d)
+d["a"].append(2)
+print("deep", quickpy.get_state())`))
+	stateVal, stateOK = decodeState(res)
+	check("state deep copy semantics",
+		err == nil && res.Type == "completed" &&
+			res.Output == "snapshot [1]\ncopy [1]\ndeep {'a': [1]}\n" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK &&
+			jsonEqual(stateVal, map[string]any{"a": []any{float64(1)}}),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Tuples normalize to lists.
+	tupleState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate tuple state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = tupleState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state((1, 2))
+print(quickpy.get_state())`))
+	stateVal, stateOK = decodeState(res)
+	check("state tuple normalizes to list",
+		err == nil && res.Type == "completed" && res.Output == "[1, 2]\n" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK &&
+			jsonEqual(stateVal, []any{float64(1), float64(2)}),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// int64 bounds are accepted and serialized exactly.
+	intState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate int state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = intState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state([-9223372036854775807 - 1, 9223372036854775807])
+print(quickpy.get_state())`))
+	check("state int64 bounds",
+		err == nil && res.Type == "completed" &&
+			res.Output == "[-9223372036854775808, 9223372036854775807]\n" &&
+			res.StateWritten != nil && *res.StateWritten &&
+			string(res.State) == "[-9223372036854775808,9223372036854775807]",
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Finite floats round-trip through the JSON state channel.
+	floatState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate float state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = floatState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state({"f": 1.5})
+print(quickpy.get_state()["f"])`))
+	stateVal, stateOK = decodeState(res)
+	check("state finite float",
+		err == nil && res.Type == "completed" && res.Output == "1.5\n" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK &&
+			jsonEqual(stateVal, map[string]any{"f": float64(1.5)}),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Neighboring float64 values that float32 collapses must stay distinct.
+	neighborState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate neighbor float state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = neighborState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state([1.0, 1.0000000000000002])
+print(quickpy.get_state())`))
+	stateVal, stateOK = decodeState(res)
+	neighbors, neighborsOK := stateVal.([]any)
+	check("state float64 neighboring doubles",
+		err == nil && res.Type == "completed" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK && neighborsOK &&
+			len(neighbors) == 2 &&
+			neighbors[0] == float64(1.0) &&
+			neighbors[1] == 1.0000000000000002 &&
+			neighbors[0] != neighbors[1],
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Non-trivial float64 values that float32 cannot represent must round-trip
+	// through the completed state channel with host float64 equality.
+	roundtripState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate roundtrip float state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = roundtripState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state({"small": 0.1, "large": 123456789.123456789})
+print(quickpy.get_state())`))
+	stateVal, stateOK = decodeState(res)
+	roundtrip, roundtripOK := stateVal.(map[string]any)
+	check("state float64 non-trivial roundtrip",
+		err == nil && res.Type == "completed" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK && roundtripOK &&
+			roundtrip["small"] == 0.1 &&
+			roundtrip["small"] != float64(float32(0.1)) &&
+			roundtrip["large"] == 123456789.123456789 &&
+			roundtrip["large"] != float64(float32(123456789.123456789)),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// A float 1.0 must stay a float on the wire, not collapse to integer 1.
+	oneState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate one float state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = oneState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state(1.0)
+print(quickpy.get_state())`))
+	stateVal, stateOK = decodeState(res)
+	check("state float64 1.0 identity",
+		err == nil && res.Type == "completed" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK &&
+			stateVal == float64(1.0) && string(res.State) == "1.0",
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// The guest parser keeps integer and float syntax distinct.  The host must
+	// send float64 1.0 as 1.0, not 1, to preserve type identity.
+	rawInitial, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate raw initial state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = rawInitial.invokeJSON(ctx, startRequestWithState(`import quickpy
+s = quickpy.get_state()
+print(isinstance(s["i"], int), isinstance(s["f"], float))`,
+		json.RawMessage(`{"i":1,"f":1.0}`)))
+	check("state initial int/float identity",
+		err == nil && res.Type == "completed" && res.Output == "True True\n" &&
+			res.StateWritten != nil && !*res.StateWritten && res.State == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Tool arguments and results use the same float64 JSON channel.
+	toolFloat, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate tool float state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = toolFloat.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+
+async def main():
+    a, b = await asyncio.gather(
+        quickpy.tools.a(value=0.1),
+        quickpy.tools.b(value=1.0000000000000002),
+    )
+    quickpy.set_state({"a": a, "b": b})
+
+quickpy.run(main())`))
+	ca, okA = findCall(res.Calls, "a")
+	cb, okB = findCall(res.Calls, "b")
+	check("tool float64 argument fidelity",
+		err == nil && res.Type == "suspended" && okA && okB &&
+			ca.Args["value"] == 0.1 &&
+			ca.Args["value"] != float64(float32(0.1)) &&
+			cb.Args["value"] == 1.0000000000000002,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	if okA && okB {
+		res, err = toolFloat.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": ca.ID, "ok": true, "value": 0.1},
+			{"id": cb.ID, "ok": true, "value": 1.0000000000000002},
+		}, false))
+		stateVal, stateOK = decodeState(res)
+		toolState, toolStateOK := stateVal.(map[string]any)
+		check("tool float64 result fidelity",
+			err == nil && res.Type == "completed" &&
+				res.StateWritten != nil && *res.StateWritten && stateOK && toolStateOK &&
+				toolState["a"] == 0.1 &&
+				toolState["a"] != float64(float32(0.1)) &&
+				toolState["b"] == 1.0000000000000002,
+			fmt.Sprintf("err=%v response=%+v", err, res))
+	}
+
+	// Unicode strings round-trip through the JSON state channel.
+	unicodeState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate unicode state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = unicodeState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state("héllo 😀")
+print(quickpy.get_state())`))
+	stateVal, stateOK = decodeState(res)
+	check("state unicode string",
+		err == nil && res.Type == "completed" && res.Output == "héllo 😀\n" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK &&
+			stateVal == "héllo 😀",
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Invalid values raise catchable StateError and leave the previous valid
+	// state untouched.
+	invalidState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate invalid state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = invalidState.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state({"ok": 1})
+try:
+    quickpy.set_state(b"bytes")
+except quickpy.StateError as e:
+    print("unsupported", e.code)
+a = []
+a.append(a)
+try:
+    quickpy.set_state(a)
+except quickpy.StateError as e:
+    print("cycle", e.code)
+deep = []
+for _ in range(70):
+    deep = [deep]
+try:
+    quickpy.set_state(deep)
+except quickpy.StateError as e:
+    print("depth", e.code)
+big = [None] * 210000
+try:
+    quickpy.set_state(big)
+except quickpy.StateError as e:
+    print("size", e.code)
+try:
+    quickpy.set_state({1: "x"})
+except quickpy.StateError as e:
+    print("key", e.code)
+try:
+    quickpy.set_state(float("nan"))
+except quickpy.StateError as e:
+    print("nan", e.code)
+try:
+    quickpy.set_state(float("inf"))
+except quickpy.StateError as e:
+    print("inf", e.code)
+print("after", quickpy.get_state())`))
+	stateVal, stateOK = decodeState(res)
+	check("state invalid values rejected",
+		err == nil && res.Type == "completed" &&
+			strings.Contains(res.Output, "unsupported unsupported_type\n") &&
+			strings.Contains(res.Output, "cycle cycle\n") &&
+			strings.Contains(res.Output, "depth depth_exceeded\n") &&
+			strings.Contains(res.Output, "size size_exceeded\n") &&
+			strings.Contains(res.Output, "key non_string_key\n") &&
+			strings.Contains(res.Output, "nan non_finite_float\n") &&
+			strings.Contains(res.Output, "inf non_finite_float\n"),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	check("state invalid preserves previous",
+		err == nil && res.Type == "completed" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK &&
+			jsonEqual(stateVal, map[string]any{"ok": float64(1)}),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// A fresh instance has no previous state.
+	freshState, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate fresh state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = freshState.invokeJSON(ctx, startRequest(`import quickpy
+print(quickpy.get_state())`))
+	check("state fresh instance none",
+		err == nil && res.Type == "completed" && res.Output == "None\n" &&
+			res.StateWritten != nil && !*res.StateWritten && res.State == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Explicit initial_state:null is the same as an absent field.
+	nullInitial, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate null initial state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = nullInitial.invokeJSON(ctx, startRequestWithState(`import quickpy
+print(quickpy.get_state())`, nil))
+	check("state initial null",
+		err == nil && res.Type == "completed" && res.Output == "None\n" &&
+			res.StateWritten != nil && !*res.StateWritten && res.State == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// An out-of-range initial_state integer is rejected before source runs.
+	badInitial, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate bad initial state: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = badInitial.invokeJSON(ctx, startRequestWithState(
+		`print("should not run")`, json.RawMessage(`9223372036854775808`)))
+	check("state initial invalid int rejected",
+		err == nil && res.Type == "failed" && res.Error != nil &&
+			res.Error.Type == "StateError" && res.Output == "" &&
+			res.StateWritten == nil && res.State == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
 
 	if failures > 0 {
 		fmt.Printf("%d failure(s)\n", failures)

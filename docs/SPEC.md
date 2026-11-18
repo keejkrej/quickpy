@@ -1,7 +1,7 @@
 # QuickPy Technical Specification
 
-**Status:** Proposed / v0.1
-**Scope:** This document defines the intended contract and architecture. M0 feasibility is complete and independently verified (see `cmd/quickpy-spike/README.md` and `guest/M0_NOTES.md` for build hashes, commands, and measurements), but nothing here should be read as a claim of a finished public SDK, production hardening, persistence, or pi-go integration. Support is explicitly experimental.
+**Status:** M1 implementation, not stable / v0.1
+**Scope:** This document defines the intended contract and architecture. M0 feasibility is complete and independently verified (see `cmd/quickpy-spike/README.md` and `guest/M0_NOTES.md` for build hashes, commands, and measurements). The M1 public SDK + persistence increment is integration-tested but not a full M1 acceptance or release. Nothing here should be read as a claim of a finished public SDK, production hardening, full M1 acceptance, or pi-go integration. Support is explicitly experimental.
 
 ---
 
@@ -165,26 +165,34 @@ The following existing behavior is the reference, adapted to Python:
 
 ---
 
-## 6. Public Go contract (proposed)
+## 6. Public Go contract (M1 implementation, not stable)
 
-Names below are **proposed** and may change during M0. Their semantics are the contract; low-level type/function spellings are not frozen until the feasibility spike exits.
+This section describes the **M1 implementation**. Names are now concrete in the
+root `quickpy` package, but the API is **pre-1.0** and may still change. The
+semantics here are normative unless a status deviation is listed in
+[`M1_STATUS.md`](M1_STATUS.md). M1 is not accepted as a full release yet.
 
 ### 6.1 Core types
 
 ```go
 type Runtime struct { /* unexported */ }
 
+type ArtifactSource struct {
+    Path  string   // exactly one of Path or Bytes
+    Bytes []byte
+}
+
 type RuntimeOptions struct {
-    Artifact          ArtifactSource     // required; bytes or loader
-    MaxMemoryBytes    int64              // required > 0; per-instance linear-memory cap
+    Artifact          ArtifactSource     // required; Path or Bytes
+    MaxMemoryBytes    int64              // required > 0; runtime-level linear-memory cap
     MaxExecutions     int                // required > 0; simultaneous in-flight executions
-    DefaultTimeout    time.Duration      // 30s; 0 explicitly disables the default timeout
+    DefaultTimeout    time.Duration      // 0 explicitly means no default timeout
     MaxSourceBytes    int                // 256 KiB
     MaxMessageBytes   int                // 1 MiB per protocol message
     MaxOutputBytes    int                // 4 MiB text+console+image
     MaxToolResultBytes int               // 1 MiB
     MaxStateBytes     int                // 1 MiB
-    MaxToolCalls      int                // 1000; 0 explicitly means no cap
+    MaxToolCalls      int                // 0 explicitly means no cap
     MaxConcurrentToolCalls int           // 8
     MaxPendingCalls   int                // 64; ledger safety cap
     MaxResumes        int                // 10000; scheduler safety cap
@@ -196,7 +204,7 @@ type ExecuteRequest struct {
     Filename      string        // required; used in tracebacks and syntax errors
     InitialState  Value         // optional; copied into the fresh instance
     Timeout       time.Duration // 0 = inherit runtime default; may only tighten
-    MaxMemoryBytes int64        // 0 = inherit; may only lower
+    MaxMemoryBytes int64        // 0 = inherit; nonzero must equal the runtime cap
     MaxOutputBytes int          // 0 = inherit; may only lower
     MaxToolCalls   int          // 0 = inherit; may only lower
     EventSink      func(Event)  // optional; overrides runtime default
@@ -216,7 +224,7 @@ func (e *Execution) Wait(ctx context.Context) (Result, error)
 func (e *Execution) Cancel()   // idempotent
 ```
 
-Proposed tool types:
+Tool types:
 
 ```go
 type ToolHandler func(ctx context.Context, call ToolCall) (Value, error)
@@ -239,7 +247,7 @@ type ToolError struct {
 func (e *ToolError) Error() string
 ```
 
-Proposed value types:
+Value types:
 
 ```go
 // Value is restricted to: nil, bool, int64, float64, string, []Value, map[string]Value.
@@ -257,7 +265,7 @@ Consumers must not have to encode/decode protocol frames or touch WASM memory.
 4. `Wait` observes the execution. It may be called multiple times; concurrent and repeated calls return the same terminal result/error. `Wait`'s context bounds only the waiting, not the execution. If that context expires before the execution is terminal, `Wait` returns `ErrWaitTimeout` (wrapping the context error); this is not cached as the execution's terminal error, and a later `Wait` can still obtain completion. To stop execution use `Cancel` or cancel the context passed to `Execute`.
 5. Cancelling the `Execute` context requests cancellation of the execution.
 6. `Cancel` is idempotent. Cancelling a finished execution is a no-op.
-7. `Close` stops accepting new executions, cancels in-flight executions, and is idempotent. It waits until guest entries and SDK-owned bookkeeping have stopped or its context expires; it does not await handlers that ignore cancellation. If the context expires, shutdown continues in the background and `Close` returns the context error. The compiled module and instances are released only once guest entries have actually stopped. Subsequent `Execute` calls return `ErrClosed`.
+7. `Close` stops accepting new executions, cancels in-flight executions, and is idempotent. It waits until guest entries and SDK-owned bookkeeping have stopped or its context expires; it does not await handlers that ignore cancellation. If the context expires, shutdown continues in the background and `Close` returns the context error. The compiled module and instances are released only once guest entries have actually stopped. Subsequent `Execute` calls return a `RuntimeClosed` error.
 
 Terminal statuses: `Completed`, `Failed`, `Cancelled`, `TimedOut`, `LimitExceeded`, `Stalled`. A guest trap or protocol violation is a `Failed` result with kind `GuestFault`/`ProtocolError`; it never hangs the handle. On any non-nil terminal error, `Result` may still carry partial ordered outputs, `Status`, and call counts, but `State` is nil and `StateWritten` is false; callers must check the error before using the result. A wait-local `ErrWaitTimeout` returns a zero `Result` and does not change execution state.
 
@@ -276,7 +284,8 @@ Terminal statuses: `Completed`, `Failed`, `Cancelled`, `TimedOut`, `LimitExceede
 - `MaxExecutions` means **simultaneous in-flight executions**, not total executions over the runtime's lifetime. When the cap is reached, `Execute` returns `CapacityExceeded` immediately; it does not block.
 - Per-execution options select source, filename, initial state, stricter limits/timeout, and a sink override.
 - Per-execution options may only tighten, never loosen, runtime ceilings. A looser request is rejected as `InvalidRequest`. A zero per-execution limit means "inherit the runtime value", not "unlimited". A per-execution timeout cannot disable or extend a runtime default; if the runtime default is 0 (explicitly no default), a per-execution timeout may set one.
-- `MaxMemoryBytes` and `MaxExecutions` are required and must be > 0. All other numeric limits must be > 0 except `MaxToolCalls` (0 explicitly means no cap) and `DefaultTimeout` (0 explicitly means no default timeout). QuickPy bounds guest linear memory by `MaxMemoryBytes × MaxExecutions`; it does not bound all host memory (Go heap, wazero overhead, tool handlers). Hosts must budget those separately to support a no-host-OOM claim.
+- **Memory is the exception to tightening.** The current engine enforces only the runtime-level `MaxMemoryBytes`; it cannot apply a tighter per-execution cap. `ExecuteRequest.MaxMemoryBytes` must therefore be zero (inherit) or exactly equal to `RuntimeOptions.MaxMemoryBytes`. Any other value is rejected with `InvalidRequest` before admission. This is an explicit unsupported rejection, not a silent no-op.
+- `MaxMemoryBytes` and `MaxExecutions` are required and must be > 0. All other numeric limits must be > 0 except `MaxToolCalls` (0 explicitly means no cap) and `DefaultTimeout` (0 explicitly means no default timeout). QuickPy bounds guest linear memory by the runtime-level `MaxMemoryBytes`; the current engine does not enforce a separate per-instance cap. It does not bound all host memory (Go heap, wazero overhead, tool handlers). Hosts must budget those separately to support a no-host-OOM claim.
 - Limits are resolved before the instance starts and passed to the guest in the start message so the guest can reject oversized tool results early.
 
 ### 6.5 Events and outputs
@@ -295,7 +304,7 @@ type ToolEvent    struct { Phase string; Name string; CallID string; Error strin
 - Text, console, and image ordering is the guest's emission order. Tool events are interleaved at the point the SDK observes the call start/finish. Interleaving from concurrent guest tasks is whatever the guest runtime produced; the host must not reorder by timestamp.
 - `ToolEvent.CallID` is an opaque diagnostic identifier only. Consumers cannot use it to resume, correlate, or address calls, and it is never exposed to Python. It may be omitted in a future revision without changing the contract.
 
-`Result` (proposed shape):
+`Result` shape:
 
 ```go
 type Status string // Completed, Failed, Cancelled, TimedOut, LimitExceeded, Stalled
@@ -335,7 +344,7 @@ type Result struct {
 
 `Wait` may also return the sentinel `ErrWaitTimeout` when only its own context expires; that is not a terminal `*Error` and does not change execution state.
 
-Proposed error shape:
+Error shape:
 
 ```go
 type Error struct {
@@ -391,7 +400,8 @@ Host tool mistakes are distinct from script failures:
 | Resume cap exceeded | none (host abort) | `LimitExceeded` |
 | Stack overflow the VM can raise | catchable `RecursionError` | none if caught; `ScriptError` if uncaught |
 | Stack overflow that cannot be raised | none | `LimitExceeded` if a stack cap is configured, else `GuestFault` |
-| State write exceeds `MaxStateBytes` | catchable `StateError` | none if caught; `ScriptError` if uncaught; `LimitExceeded` if detected at finalization |
+| Guest rejects a state value (unsupported type, cycle, depth, non-finite float, etc.) | catchable `StateError` | none if caught; `ScriptError` if uncaught |
+| Committed state exceeds the host `MaxStateBytes` at finalization | none | `LimitExceeded`; state is not committed |
 | Malformed or truncated protocol frame | none | `ProtocolError` |
 | Configured protocol message cap exceeded | none | `LimitExceeded` |
 | Arbitrary WASM trap | none | `GuestFault` |
@@ -406,14 +416,14 @@ Partial outputs are retained on every terminal error. State is never committed o
 - The handler receives an execution-derived `context.Context` that is cancelled when the execution is cancelled/times out/closes. It also receives the deadline.
 - A handler may run concurrently with other handlers of the same execution (bounded by `MaxConcurrentToolCalls`). A handler may still be running when the guest resumes with other responses; it must never call into the guest. Handlers for one execution may run in any order.
 - Handler calls for different executions are independent.
-- Re-entry into the same execution from a handler is rejected deterministically with `ErrReentrant`; the SDK never blocks waiting for itself. Starting a different execution from a handler is allowed but subject to `MaxExecutions` and host policy.
+- Re-entry into the same execution from a handler is rejected deterministically with a `Reentrant` error; the SDK never blocks waiting for itself. Starting a different execution from a handler is allowed but subject to `MaxExecutions` and host policy.
 - Call IDs and response correlation are private. Guest resume is serialized by the owner. `ToolEvent.CallID` is diagnostic only and cannot be used to resume or correlate calls.
 
-### 6.8 Guest protocol (private, proposal)
+### 6.8 Guest protocol (private, v0)
 
 Transport: JSON messages over WASM linear-memory buffers, length-prefixed. Exports are private implementation details; hosts must not use them directly.
 
-Proposed exports:
+Exports:
 
 - `qp_abi_version() -> i32` — major/minor packed; checked at instance start.
 - `qp_alloc(len) -> ptr`, `qp_free(ptr, len)` — message buffer management; callable only while no guest entry is active.
@@ -427,7 +437,7 @@ Every entry is synchronous from the WASI perspective: the guest runs until it co
 
 ### 6.9 Call ledger and suspension protocol (protocol v0)
 
-The host and guest maintain a per-execution call ledger. The protocol is private, but v0 must be implementable independently by both sides. The names below match the current spike; a separate `call_requests` wire type is a possible future refactor, not part of v0.
+The host and guest maintain a per-execution call ledger. The protocol is private, but v0 must be implementable independently by both sides. The names below match the current implementation; a separate `call_requests` wire type is a possible future refactor, not part of v0.
 
 - A `suspended` response carries `reason` (`runnable`, `awaiting_calls`, `stalled`, or future `awaiting_timer`), `calls` (a **delta** of calls newly requested since the previous guest→host message), `awaiting` (the complete list of call IDs requested but not yet delivered to the guest), and an `output` delta. Each `calls` entry has `call_id`, `name`, and `args`. `call_id` is opaque, unique for the execution, never reused, and generated by the guest.
 - Reason semantics are normative: `awaiting_calls` is **nonterminal** and requires a non-empty `awaiting`; a resume while a call is still pending returns `awaiting_calls` again. `stalled` is **terminal**, carries `stalled: true`, and requires the main task unfinished with no runnable work, no undelivered calls, and no armed timers; a stalled suspension must never be resumed. `runnable` requires an empty `awaiting`; it is reserved but not emitted by the current real build.
@@ -509,7 +519,7 @@ Timer support is deliberately conservative and **settled for the M0/M1 baseline*
 - Import statements behave like MicroPython module imports for the allowlisted/frozen modules. There is no package manager, no `sys.path` from the host, and no implicit host modules.
 - **Top-level `await` is not supported** in the baseline because ordinary Python does not allow it. A top-level `await` is a syntax error reported against the original source.
 - **Top-level `return` is not supported.**
-- Async host tools require an async context. The proposed driver is:
+- Async host tools require an async context. The driver is:
 
 ```python
 import asyncio
@@ -537,12 +547,12 @@ Consequences that are part of the baseline:
 - Errors, syntax errors, and tracebacks must report the provided filename and original source line numbers.
 - There is exactly one guest thread. Threads and multiprocessing are unsupported.
 
-### 8.2 M0 questions that may change the baseline
+### 8.2 Resolved M0 questions and remaining M1 work
 
 1. The spike demonstrates suspend/resume of rooted tasks across `quickpy.run` for the basic `gather` path, independently verified, including corrected `awaiting_calls`/`stalled` reasons and forced-GC allocation pressure with pending calls. Broader GC/NLR/task-rooting stress and lifetime remain M1 hardening.
 2. Top-level `await`/`return` are not supported. If top-level `await` is later desired, prefer MicroPython compiler support (`MICROPY_COMP_ALLOW_TOP_LEVEL_AWAIT` / `mp_compile_allow_top_level_await`) and root/drive the returned module generator (cf. upstream `ports/webassembly/proxy_c.c`) over naive indent/wrap transforms. It preserves module names, imports, and line numbers better, but is **not implemented or accepted**; top-level `return` remains unsupported.
-3. The stock `asyncio` loop cannot be repeatedly driven for this model; the current implementation customizes it. The exact supported primitives and failure matrix remain M0 work.
-4. What exact subset of `asyncio` is supported (`gather`, `wait_for`, `sleep(0)`, `create_task`, `Lock`, `Queue`)? Unsupported primitives must fail loudly at call time. A normative subset/failure matrix is required before M1.
+3. The stock `asyncio` loop cannot be repeatedly driven for this model; the current implementation customizes it. The exact supported primitives and failure matrix remain M1 work.
+4. What exact subset of `asyncio` is supported (`gather`, `wait_for`, `sleep(0)`, `create_task`, `Lock`, `Queue`)? Unsupported primitives must fail loudly at call time. A normative subset/failure matrix is still required for M1 acceptance.
 5. `quickpy.run` is once per execution; a second call raises. Whether it can be re-entered after a suspension is not part of the baseline.
 6. How are imports of the `quickpy` module resolved (frozen module vs generated bootstrap)?
 7. Should the execution expose a final structured result (e.g. `quickpy.result(value)`) or only outputs? Not in MVP unless the spike makes it cheap.
@@ -574,7 +584,7 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 - Cycles are rejected. Shared references (a DAG) are serialized by value; identity is not preserved.
 - Object key order is preserved by the codec but is not semantic.
 - Duplicate keys cannot occur after Python `dict` construction; on the host side, duplicate JSON keys are a protocol error.
-- Defaults (proposed, configurable): maximum depth 64, maximum message size 1 MiB, maximum string length 256 KiB, maximum total nodes 100k. Exceeding them fails safely before dispatch or before resume.
+- Defaults (configurable): maximum depth 64, maximum message size 1 MiB, maximum string length 256 KiB, maximum total nodes 100k. Exceeding them fails safely before dispatch or before resume.
 - Integers and floats stay distinct: an integer token decodes to int64, a token with `.`/exponent decodes to float64. The encoder must emit a decimal point or exponent for every float64 (including integral values such as `1.0`) so the distinction survives. Consumers needing exact integer semantics must use `int64`.
 - Tool results are subject to the same rules; an invalid result is a host failure, not a script error.
 - `mp_obj_t`, pointers, and raw guest structs must never appear in the host-facing API or be accepted from consumers.
@@ -589,7 +599,7 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 - Guest resume remains serialized. Concurrency exists only among host tool executions and among guest tasks as scheduled by the guest runtime.
 - Ordering of tool calls as **observed by the host** is not a language guarantee; ordering of tool results as **observed by the script** follows the awaited API.
 - A tool call must not block the owner goroutine. Handlers that do CPU-heavy work must be bounded by the host application; the execution timeout is the only QuickPy-level backstop.
-- Nested/re-entrant guest entry from a tool handler is forbidden. A handler that calls back into the same execution is rejected deterministically with `ErrReentrant` (Kind `Reentrant`); the SDK never blocks waiting for itself.
+- Nested/re-entrant guest entry from a tool handler is forbidden. A handler that calls back into the same execution is rejected deterministically with a `Reentrant` error (Kind `Reentrant`); the SDK never blocks waiting for itself.
 - Tools are dispatched by name from the execution snapshot; name lookups are case-sensitive.
 
 ---
@@ -618,10 +628,10 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 
 - Persistence is an **explicit JSON-like state value**, never a live VM image.
 - `InitialState` is deep-copied into the fresh guest before source execution and exposed via `quickpy.get_state()`.
-- A script may replace state with `quickpy.set_state(value)`. Whether a read-only `quickpy.state` attribute also exists is an open question; the functions are normative.
+- A script may replace state with `quickpy.set_state(value)`. There is no `quickpy.state` attribute; the functions are normative. An invalid value raises a catchable `quickpy.StateError` and leaves the previous valid state unchanged.
 - State is written to the host only if the execution completes successfully **and** a state write occurred. Failed, cancelled, timed-out, and limited executions must not commit state.
 - The result contains the committed state or nil. The store is schema-less from QuickPy's perspective; the consumer owns its shape and versioning.
-- State size is bounded by `MaxStateBytes` and value depth limits. A state write that exceeds limits aborts finalization with `LimitExceeded`; the previous state remains untouched.
+- State size is bounded by `MaxStateBytes` and value depth limits. The guest rejects an invalid value with a catchable `StateError`; if the committed value exceeds the host `MaxStateBytes` at finalization, the execution ends as `LimitExceeded` and the state is **not** committed. The previous state remains untouched.
 - There is no snapshot, no serialization of Python objects, no resumption of a partially run program.
 - Tool registrations are runtime configuration, not state; they survive executions. Globals, imported modules' mutable state, and the heap do not.
 
@@ -650,11 +660,11 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 ### 13.3 Resource limits
 
 - **Time:** execution timeout enforced via context. While `Running`, cancellation is host-led forced termination using wazero `CloseOnContextDone`; the host waits for the active entry to return and classifies from the latched cause. No guest interrupt export is required. While `Suspended`, cooperative `abort` is the intended path; the M0 guest does not implement it, so forced close is used.
-- **Memory:** `MaxMemoryBytes` is required and caps each instance's linear memory; the guest heap is sized to fit. A configured cap hit is `LimitExceeded`; a catchable `MemoryError` is possible only when the VM can still raise. Unattributed OOM/traps are `GuestFault`. QuickPy bounds guest linear memory, not all host memory; hosts must budget wazero overhead and tool handlers.
+- **Memory:** `MaxMemoryBytes` is required and is applied at the wazero runtime level; the current engine does not enforce a separate per-instance cap. A per-execution `MaxMemoryBytes` must be zero (inherit) or exactly equal to the runtime value; a tighter value is rejected with `InvalidRequest`. A configured cap hit is `LimitExceeded`; a catchable `MemoryError` is possible only when the VM can still raise. Unattributed OOM/traps are `GuestFault`. QuickPy bounds guest linear memory, not all host memory; hosts must budget wazero overhead and tool handlers.
 - **Stack:** guest recursion/stack limit enforced by MicroPython configuration or the adapter; overflow becomes a catchable `RecursionError` where possible, else `LimitExceeded` if a stack cap is configured, otherwise `GuestFault`.
 - **Output:** total output bytes, per-message size, per-tool-result size, state size.
 - **Calls:** `MaxToolCalls`, `MaxConcurrentToolCalls`, `MaxPendingCalls`, and `MaxResumes` are configured defaults and are enforced. Exceeding `MaxToolCalls` raises catchable `ToolLimitError`; exceeding `MaxPendingCalls` or `MaxResumes` is `LimitExceeded`.
-- **Instance:** `MaxExecutions` is required and bounds simultaneous in-flight executions; guest linear memory is bounded by `MaxMemoryBytes × MaxExecutions`.
+- **Instance:** `MaxExecutions` is required and bounds simultaneous in-flight executions. Guest linear memory is bounded by the runtime-level `MaxMemoryBytes`, not by a per-instance cap.
 - Stack traces and protocol buffers are bounded to avoid host OOM on a hostile guest.
 
 ### 13.4 Threats explicitly not mitigated
@@ -669,8 +679,8 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 
 ## 14. Compatibility and versioning
 
-- **Guest protocol:** integer major/minor version, checked via `qp_abi_version()` during startup. Major mismatch fails with `ProtocolError`; minor mismatch is accepted only if the Go SDK declares support.
-- **Artifact:** embeds engine name/version and protocol version; `Result.Guest` reports them for diagnostics.
+- **Guest protocol:** integer major/minor version, checked via `qp_abi_version()` during startup. The current host requires **ABI 2** (packed 0.2) and rejects 0.1 artifacts with a protocol/ABI error rather than silently losing initial state. A future minor mismatch is accepted only if the Go SDK declares support.
+- **Artifact:** embeds engine name/version and protocol version; `Result.Guest` reports them for diagnostics. `GuestInfo.Version` is currently blank (see [`M1_STATUS.md`](M1_STATUS.md)).
 - **Python compatibility:** the language is "MicroPython subset", not CPython. Document supported syntax/modules, known deviations, and the exact MicroPython pin. `sys.version` must identify the engine honestly.
 - **SDK API stability:** pre-1.0, names may change. Semantics in this document (lifecycle, isolation, error taxonomy, value rules) are the compatibility target.
 - **Protocol portability:** the protocol must not depend on Go. A future SDK in another language should be able to implement the same control flow, even though only Go is targeted initially.
@@ -680,7 +690,7 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 
 ## 15. Conformance and testing strategy
 
-M0 acceptance is complete and independently verified; the broader suites below are M1 work and are not yet fully implemented. Current evidence tiers are: **guest smoke** (41 checks against the real artifact), **host synthetic** (Go unit/integration harness), and **independently verified real integration** (reproduced by a separate verifier). Items already covered by M0 evidence are noted in Section 16.
+M0 acceptance is complete and independently verified. The M1 public SDK + persistence increment now has a permanent real-artifact integration suite in [`../integration/`](../integration/), documented in [`../integration/README.md`](../integration/README.md). Current evidence tiers are: **guest smoke** (66 checks against the real artifact, 41 M0 + 25 M1), **host synthetic** (Go unit tests, including the public root package and the low-level `internal/wasmguest` suite), and **real-artifact public integration** (40 top-level tests plus 14 subtests, ~7.9 s; race run ~40.3 s; skips cleanly when `QUICKPY_TEST_ARTIFACT` is unset). These integration results are worker-reported; independent verification is being started. The suite covers state rollback, events/order/truncation, tool float fidelity, registry snapshot/retention, repeated wait/wait-local timeout, close running/suspended/short-context/noncooperative, 100 sequential and 10 concurrent executions, empty imports/security, and per-execution memory rejection. Remaining gaps are request-specific caps not all exercised with the real artifact, real protocol/guest-fault coverage, a normative `asyncio` matrix, and a dedicated soak/resource-leak trend. Items already covered by M0 evidence are noted in Section 16; current M1 pieces and open gates are tracked in [`M1_STATUS.md`](M1_STATUS.md).
 
 1. **Value conformance:** round-trip matrix for null/bool/int boundaries/float edges/strings (including Unicode and rejected surrogates)/nested containers; rejection of NaN, Inf, int overflow, cycles, non-string keys, unsupported types, depth/size overflow; DAG duplication; int/float distinction.
 2. **Protocol conformance:** ABI handshake, unknown message, duplicate response, unknown call ID, oversized frame, truncated frame, malformed JSON, sequence mismatch, ledger transitions, duplicate guest call IDs, partial response delivery, no redispatch after later suspensions, and tombstone behavior. All must produce a structured error, not a hang or panic.
@@ -729,6 +739,16 @@ M0 could have failed; a failure would have been a valid outcome that redirects t
 
 ### M1 — SDK MVP
 
+**Status: coherent public SDK + persistence increment, integration-tested; not
+a full M1 acceptance or release.** The checklist below is the acceptance target,
+not a claim that every item is done. The permanent real-artifact integration
+suite is worker-reported passing (40 top-level tests plus 14 subtests, ~7.9 s;
+race run ~40.3 s) and skips cleanly without `QUICKPY_TEST_ARTIFACT`; independent
+verification is being started. Current coverage, the capacity-race regression
+that was found and fixed, and open gates are tracked in
+[`M1_STATUS.md`](M1_STATUS.md); do not read an unchecked item as either passed
+or failed without checking that page.
+
 Exit criteria:
 
 1. Public Go contract implemented for `Runtime`, `RegisterTool`, `Execute`, `Execution.Wait/Cancel`, `Close`, events, results, and errors as specified (names may evolve).
@@ -759,15 +779,18 @@ Exit criteria:
 
 ## 17. Open questions
 
+Items marked **(M0)** are resolved historical questions. The rest are M1
+remaining work unless noted as settled.
+
 1. MicroPython's scheduler returns to the host at await points and resumes rooted tasks for the basic `gather` path, independently verified. Broader GC/NLR/task-rooting stress and lifetime remain M1 hardening. (M0)
 2. Top-level `await` is unsupported. If later desired, prefer MicroPython compiler support (`MICROPY_COMP_ALLOW_TOP_LEVEL_AWAIT` / `mp_compile_allow_top_level_await`) and root/drive the returned module generator over naive transforms; not implemented or accepted. Top-level `return` remains unsupported. (M0)
 3. The real guest artifact imports zero WASI functions and the host allowlist is empty; `path_open`, `environ_get`, `args_get`, and `poll_oneoff` are rejected before instantiation. If later builds import any, the exact allowlist and controlled stdout capture without filesystem access must be recorded. (M0)
-4. Exact supported `asyncio` subset and its failure modes.
-5. Timers: settled for M0/M1 as positive timers rejected and no host clock; revisit only with a concrete protocol and cancellation tests. Stall detection distinguishes "sleeping" from "stuck" by rejecting positive sleeps rather than treating them as progress.
+4. Exact supported `asyncio` subset and its failure modes. Still required for M1 acceptance.
+5. Timers: settled for M0/M1 as positive timers rejected and no host clock; revisit only with a concrete protocol and cancellation tests. Stall detection distinguishes "sleeping" from "stuck" by rejecting positive sleeps rather than treating them as progress. (settled)
 6. Whether guest `print`/console output should be separate streams or a single ordered stream with levels.
 7. Should executions expose a final structured result beyond output/state?
-8. Default limit values and measurement-based tuning. The no-loosening rule is settled: per-execution limits may only tighten runtime ceilings.
-9. State API shape (`quickpy.state` attribute vs functions) and whether multiple named stores are needed.
+8. Default limit values and measurement-based tuning. The no-loosening rule is settled: per-execution limits may only tighten runtime ceilings, except memory, where only inherit-or-equal is supported until the backend can enforce a tighter per-execution cap.
+9. State API shape: resolved for M1 as `quickpy.get_state()`/`set_state()` with no `quickpy.state` attribute. Multiple named stores remain out of scope unless a concrete need appears.
 10. Whether tool metadata/schemas belong in QuickPy or only pi-go.
 11. Distribution of the artifact (embedded via `go:embed`, external file, cache) and reproducibility of builds.
 12. Multiple guest backends in one Runtime and negotiation rules.
