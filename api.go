@@ -120,6 +120,9 @@ type Result struct {
 func (r Result) HasState() bool { return r.StateWritten }
 
 // GuestInfo identifies the guest engine for one execution.
+//
+// Engine and Version come from the ABI 0.4 guest identity metadata. If an
+// artifact omits the version, Version is "unknown" rather than blank.
 type GuestInfo struct {
 	Engine          string
 	Version         string

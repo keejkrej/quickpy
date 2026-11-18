@@ -235,6 +235,44 @@ func TestErrorDoesNotCommitState(t *testing.T) {
 	}
 }
 
+func TestToolErrorKindsDoNotCommitState(t *testing.T) {
+	kinds := []Kind{
+		KindScriptError,
+		KindGuestFault,
+		KindHostFault,
+		KindProtocolError,
+		KindLimitExceeded,
+		KindCancelled,
+		KindTimedOut,
+		KindStalled,
+	}
+	for _, kind := range kinds {
+		t.Run(string(kind), func(t *testing.T) {
+			eng := &fakeEngine{
+				executeFn: func(ctx context.Context, req engineRequest) (engineResult, error) {
+					return engineResult{
+						Status:       statusForError(&Error{Kind: kind}),
+						State:        map[string]any{"x": int64(1)},
+						StateWritten: true,
+					}, &Error{Kind: kind, Message: "tool failure"}
+				},
+			}
+			r := testRuntime(t, RuntimeOptions{MaxMemoryBytes: 1 << 20, MaxExecutions: 1}, eng)
+			e, err := r.Execute(context.Background(), ExecuteRequest{Source: "x", Filename: "x.py"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := e.Wait(context.Background())
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if res.State != nil || res.StateWritten || res.HasState() {
+				t.Fatalf("state committed: %+v", res)
+			}
+		})
+	}
+}
+
 func TestStatusFromErrorKind(t *testing.T) {
 	tests := []struct {
 		kind Kind

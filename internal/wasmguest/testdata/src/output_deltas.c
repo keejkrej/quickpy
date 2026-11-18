@@ -6,7 +6,7 @@ static const char *responses[] = {
     "{\"v\":0,\"type\":\"suspended\",\"reason\":\"awaiting_calls\",\"calls\":[{\"id\":2,\"name\":\"b\",\"args\":{}}],\"awaiting\":[2],\"output\":\"BBBB\"}",
     "{\"v\":0,\"type\":\"completed\",\"output\":\"CCCC\"}"
 };
-EXPORT int qp_abi_version(void) { return 2; }
+EXPORT int qp_abi_version(void) { return 4; }
 EXPORT int qp_alloc(int len) { (void)len; return 1024; }
 EXPORT void qp_free(int ptr, int len) { (void)ptr; (void)len; }
 EXPORT long long qp_invoke(int ptr, int len) {

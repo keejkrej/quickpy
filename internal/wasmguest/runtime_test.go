@@ -50,8 +50,11 @@ func TestExecuteCompleted(t *testing.T) {
 	if a.InstanceID == b.InstanceID {
 		t.Fatalf("instance IDs reused: %q", a.InstanceID)
 	}
-	if a.Guest.ABIVersion != 2 {
+	if a.Guest.ABIVersion != 4 {
 		t.Fatalf("ABI version = %d", a.Guest.ABIVersion)
+	}
+	if a.Guest.Engine != "micropython" || a.Guest.Version != "1.29.0" || a.Guest.ProtocolVersion != "0" {
+		t.Fatalf("guest identity = %+v", a.Guest)
 	}
 	if a.StateWritten || a.State != nil {
 		t.Fatalf("state committed without a write: written=%v state=%#v", a.StateWritten, a.State)
@@ -208,7 +211,7 @@ func TestABIVersionMismatch(t *testing.T) {
 	if !ok || we.Kind != KindProtocolError {
 		t.Fatalf("error = %v", err)
 	}
-	if !strings.Contains(we.Message, "unsupported ABI version 3") {
+	if !strings.Contains(we.Message, "unsupported ABI version 5") {
 		t.Fatalf("message = %q", we.Message)
 	}
 }
@@ -223,11 +226,105 @@ func TestABIOldVersionRejected(t *testing.T) {
 	if !ok || we.Kind != KindProtocolError {
 		t.Fatalf("error = %v", err)
 	}
-	if !strings.Contains(we.Message, "unsupported ABI version 1") {
+	if !strings.Contains(we.Message, "unsupported ABI version 2") {
 		t.Fatalf("message = %q", we.Message)
 	}
-	if res == nil || res.Guest.ABIVersion != 1 {
+	if res == nil || res.Guest.ABIVersion != 2 {
 		t.Fatalf("result = %+v", res)
+	}
+}
+
+func TestCompileMemoryLimitIsLimitExceeded(t *testing.T) {
+	// The fixture declares two initial pages. A one-page host cap is a
+	// host-configured memory limit that wazero reports at compile time, so it
+	// is safe to classify as LimitExceeded.
+	_, err := NewRuntime(context.Background(), Options{
+		ArtifactPath:    filepath.Join("testdata", "memory_limit.wasm"),
+		MaxMemoryBytes:  65536,
+		MaxMessageBytes: 1 << 20,
+		MaxOutputBytes:  1 << 20,
+	})
+	if err == nil {
+		t.Fatal("expected memory limit error")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindLimitExceeded {
+		t.Fatalf("error = %v", err)
+	}
+	if !strings.Contains(we.Message, "over limit of") {
+		t.Fatalf("message = %q", we.Message)
+	}
+}
+
+func TestMemoryGrowFailureIsScriptError(t *testing.T) {
+	// wazero returns -1 from memory.grow instead of trapping. The guest then
+	// reports MemoryError. The host must not fake a LimitExceeded
+	// classification for a guest-visible allocation failure.
+	rt := newTestRuntime(t, "memory_grow_fail.wasm")
+	res, err := rt.Execute(context.Background(), Request{Source: "grow", Filename: "main.py"})
+	if err == nil {
+		t.Fatal("expected script error")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindScriptError {
+		t.Fatalf("error = %v", err)
+	}
+	if res == nil || res.Exception == nil || res.Exception.Type != "MemoryError" {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+func TestArbitraryMemoryTrapIsGuestFault(t *testing.T) {
+	rt := newTestRuntime(t, "trap_oob.wasm")
+	res, err := rt.Execute(context.Background(), Request{Source: "oob", Filename: "main.py"})
+	if err == nil {
+		t.Fatal("expected guest fault")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindGuestFault {
+		t.Fatalf("error = %v", err)
+	}
+	if res == nil || res.Status != StatusGuestFault {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+func TestFailedToolCause(t *testing.T) {
+	rt := newTestRuntime(t, "failed_tool_cause.wasm")
+	res, err := rt.Execute(context.Background(), Request{Source: "tool", Filename: "main.py"})
+	if err == nil {
+		t.Fatal("expected script error")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindScriptError {
+		t.Fatalf("error = %v", err)
+	}
+	if we.ToolCause == nil {
+		t.Fatal("ToolCause = nil")
+	}
+	if we.ToolCause.Code != "permission_denied" || we.ToolCause.Message != "no" || we.ToolCause.Tool != "search" {
+		t.Fatalf("ToolCause = %+v", we.ToolCause)
+	}
+	if we.ToolCause.CallID == nil || *we.ToolCause.CallID != 7 {
+		t.Fatalf("ToolCause.CallID = %v", we.ToolCause.CallID)
+	}
+	if res == nil || res.Exception == nil || res.Exception.ToolCause == nil {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+func TestFailedWithoutToolCause(t *testing.T) {
+	rt := newTestRuntime(t, "failed.wasm")
+	_, err := rt.Execute(context.Background(), Request{Source: "raise", Filename: "main.py"})
+	if err == nil {
+		t.Fatal("expected script error")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindScriptError {
+		t.Fatalf("error = %v", err)
+	}
+	if we.ToolCause != nil {
+		t.Fatalf("ToolCause = %+v, want nil", we.ToolCause)
 	}
 }
 

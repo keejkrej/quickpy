@@ -3,6 +3,7 @@ package quickpy
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -126,5 +127,84 @@ func TestMapWasmErrorScriptInfo(t *testing.T) {
 	}
 	if got.ExecutionID != "exec-1" {
 		t.Fatalf("execution id = %q", got.ExecutionID)
+	}
+	if got.Tool != nil {
+		t.Fatalf("tool cause = %+v, want nil", got.Tool)
+	}
+}
+
+func TestMapWasmErrorToolCause(t *testing.T) {
+	callID := int64(7)
+	we := &wasmguest.Error{
+		Kind:      wasmguest.KindScriptError,
+		Status:    wasmguest.StatusFailed,
+		Op:        "execute",
+		Message:   "guest reported failure",
+		Exception: &wasmguest.Exception{Type: "ToolError", Message: "tool failed"},
+		ToolCause: &wasmguest.ToolCause{Code: "permission_denied", Message: "no", Tool: "search", CallID: &callID},
+	}
+	got := mapWasmError(we, "exec-1")
+	if got.Tool == nil {
+		t.Fatal("Tool = nil")
+	}
+	if got.Tool.Code != "permission_denied" || got.Tool.Message != "no" || got.Tool.Tool != "search" || got.Tool.CallID != "7" {
+		t.Fatalf("Tool = %+v", got.Tool)
+	}
+}
+
+func TestMapGuestMetadata(t *testing.T) {
+	got := mapGuest(wasmguest.GuestInfo{
+		Engine:          "micropython",
+		Version:         "1.29.0",
+		ProtocolVersion: "0",
+		ABIVersion:      4,
+	})
+	if got.Engine != "micropython" || got.Version != "1.29.0" || got.ProtocolVersion != "0" || got.ABIVersion != 4 {
+		t.Fatalf("guest = %+v", got)
+	}
+
+	// An artifact that omits identity metadata must not look complete.
+	got = mapGuest(wasmguest.GuestInfo{ABIVersion: 4})
+	if got.Engine != "micropython" || got.Version != "unknown" || got.ProtocolVersion != "0" {
+		t.Fatalf("default guest = %+v", got)
+	}
+}
+
+func TestWasmEnginePreservesPartialResultOnError(t *testing.T) {
+	rt, err := wasmguest.NewRuntime(context.Background(), wasmguest.Options{
+		ArtifactPath:    filepath.Join("internal", "wasmguest", "testdata", "async_gather.wasm"),
+		MaxMemoryBytes:  16 << 20,
+		MaxMessageBytes: 1 << 20,
+		MaxOutputBytes:  1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background())
+
+	eng := &wasmEngine{rt: rt}
+	res, err := eng.Execute(context.Background(), engineRequest{
+		Source:   "limit",
+		Filename: "main.py",
+		Timeout:  2 * time.Second,
+		Tools: map[string]ToolHandler{
+			"a": func(ctx context.Context, call ToolCall) (Value, error) { return "A", nil },
+			"b": func(ctx context.Context, call ToolCall) (Value, error) { return "B", nil },
+		},
+		MaxConcurrentToolCalls: 2,
+		MaxToolCalls:           1,
+	})
+	if err == nil {
+		t.Fatal("expected limit error")
+	}
+	var qe *Error
+	if !errors.As(err, &qe) || qe.Kind != KindLimitExceeded {
+		t.Fatalf("error = %v", err)
+	}
+	if res.ToolCalls != 1 {
+		t.Fatalf("ToolCalls = %d, want 1", res.ToolCalls)
+	}
+	if res.Guest.ABIVersion != 4 || res.Guest.Engine != "micropython" {
+		t.Fatalf("guest = %+v", res.Guest)
 	}
 }

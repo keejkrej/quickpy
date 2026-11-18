@@ -2,28 +2,46 @@ package wasmguest
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
+	"strings"
+	"unicode/utf8"
 )
 
-// Output is one ordered guest output entry. M0 only needs text and console;
-// image output is deliberately not part of the transient ABI yet.
+// Output is one ordered guest output entry. ABI 0.4 adds structured console
+// and image entries. Image data is stored as raw decoded bytes, never as the
+// base64 text that appears on the wire.
 type Output struct {
 	Type  string `json:"type"`
 	Text  string `json:"text,omitempty"`
 	Level string `json:"level,omitempty"`
+	MIME  string `json:"mime,omitempty"`
+	Data  []byte `json:"data,omitempty"`
+}
+
+// ToolCause is the structured detail of an uncaught guest ToolError. It is
+// only present on a failed response when a tool failure ended the script.
+// CallID is optional and opaque; it is a diagnostic correlation value, not a
+// resumable handle.
+type ToolCause struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Tool    string `json:"tool,omitempty"`
+	CallID  *int64 `json:"call_id,omitempty"`
 }
 
 // Exception is the structured failure detail a guest may return with a
 // "failed" response.
 type Exception struct {
-	Type      string `json:"type"`
-	Message   string `json:"message"`
-	Traceback string `json:"traceback"`
-	Filename  string `json:"filename"`
-	Line      int    `json:"line"`
+	Type      string     `json:"type"`
+	Message   string     `json:"message"`
+	Traceback string     `json:"traceback"`
+	Filename  string     `json:"filename"`
+	Line      int        `json:"line"`
+	ToolCause *ToolCause `json:"tool_cause,omitempty"`
 }
 
 // CallRequest is one guest tool request. IDs are safe JSON integers, unique
@@ -47,6 +65,12 @@ type Response struct {
 	Stalled         bool
 	UnknownFields   []string
 
+	// EngineName and EngineVersion are optional ABI 0.4 guest identity
+	// metadata. They are reported for diagnostics and never used for
+	// control flow.
+	EngineName    string
+	EngineVersion string
+
 	// StateWritten and StateRaw are only meaningful on a completed response.
 	// StateRaw is the raw JSON value of the state field; it is decoded by the
 	// execution owner with the resolved state bound so a malformed or
@@ -69,6 +93,8 @@ var topLevelKeys = map[string]bool{
 	"stalled":          true,
 	"state":            true,
 	"state_written":    true,
+	"engine_name":      true,
+	"engine_version":   true,
 }
 
 var callKeys = map[string]bool{
@@ -78,27 +104,56 @@ var callKeys = map[string]bool{
 }
 
 var outputKeys = map[string]bool{
-	"type":  true,
-	"text":  true,
-	"level": true,
+	"type":        true,
+	"text":        true,
+	"level":       true,
+	"mime":        true,
+	"data_base64": true,
 }
 
 var exceptionKeys = map[string]bool{
-	"type":      true,
-	"message":   true,
-	"traceback": true,
-	"filename":  true,
-	"line":      true,
+	"type":       true,
+	"message":    true,
+	"traceback":  true,
+	"filename":   true,
+	"line":       true,
+	"tool_cause": true,
 }
 
-// decodeResponse decodes a guest response. It tolerates unknown fields (and
-// reports them) but rejects malformed JSON, duplicate keys, wrong protocol
-// versions, wrong message types, and unknown output types. Output size is
-// enforced cumulatively by the execution owner so the retained prefix and the
-// observer stream are clipped consistently.
+var toolCauseKeys = map[string]bool{
+	"code":    true,
+	"message": true,
+	"tool":    true,
+	"call_id": true,
+}
+
+// decodeResponse decodes a guest response without a per-image allocation
+// bound. It is used by tests and by callers that only need shape validation.
 func decodeResponse(data []byte) (*Response, *Error) {
+	return decodeResponseWithMessageLimit(data, 0)
+}
+
+// decodeResponseWithMessageLimit decodes a guest response. It tolerates
+// unknown fields (and reports them) but rejects malformed JSON, duplicate
+// keys, wrong protocol versions, wrong message types, invalid UTF-8, invalid
+// console levels, invalid MIME types, invalid base64, and unknown output
+// types.
+//
+// maxImageBytes, when positive, is a message-derived allocation safety bound
+// for one decoded image. It is not the public output cap: a valid image larger
+// than MaxOutputBytes is decoded and then clipped by the execution owner as
+// part of cumulative output accounting, yielding LimitExceeded. The bound
+// exists only to avoid allocating an image larger than the protocol frame that
+// carried it.
+func decodeResponseWithMessageLimit(data []byte, maxImageBytes int) (*Response, *Error) {
 	if len(data) == 0 {
 		return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "empty guest response", nil)
+	}
+	if !utf8.Valid(data) {
+		return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response is not valid UTF-8", nil)
+	}
+	if err := validateJSONStringEscapes(data); err != nil {
+		return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "malformed guest response: "+err.Error(), err)
 	}
 	if err := checkDuplicateKeys(data); err != nil {
 		return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "malformed guest response: "+err.Error(), err)
@@ -137,6 +192,17 @@ func decodeResponse(data []byte) (*Response, *Error) {
 	case "completed", "failed", "suspended":
 	default:
 		return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("unsupported guest response type %q", resp.Type), nil)
+	}
+
+	if raw, ok := top["engine_name"]; ok && !isJSONNull(raw) {
+		if err := json.Unmarshal(raw, &resp.EngineName); err != nil {
+			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response engine_name is not a string", err)
+		}
+	}
+	if raw, ok := top["engine_version"]; ok && !isJSONNull(raw) {
+		if err := json.Unmarshal(raw, &resp.EngineVersion); err != nil {
+			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response engine_version is not a string", err)
+		}
 	}
 
 	if raw, ok := top["stalled"]; ok && !isJSONNull(raw) {
@@ -267,26 +333,13 @@ func decodeResponse(data []byte) (*Response, *Error) {
 
 	outputRaw, hasOutput := top["output"]
 	outputsRaw, hasOutputs := top["outputs"]
-	if hasOutput && hasOutputs && !isJSONNull(outputRaw) && !isJSONNull(outputsRaw) {
-		return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response must not contain both output and outputs", nil)
-	}
-	if hasOutput && !isJSONNull(outputRaw) {
-		var text string
-		if err := json.Unmarshal(outputRaw, &text); err != nil {
-			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response output is not a string", err)
-		}
-		resp.Outputs = append(resp.Outputs, Output{Type: "text", Text: text})
-	}
-
-	if raw, ok := top["output_truncated"]; ok && !isJSONNull(raw) {
-		if err := json.Unmarshal(raw, &resp.OutputTruncated); err != nil {
-			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response output_truncated is not a boolean", err)
-		}
-	}
-
-	if raw, ok := top["outputs"]; ok && !isJSONNull(raw) {
+	// An explicit outputs array always wins. The legacy output string is a
+	// text-only aggregate that the guest still emits for older consumers; it
+	// must never be counted a second time when outputs is present. An empty
+	// outputs array therefore means "no output", not "fall back to output".
+	if hasOutputs && !isJSONNull(outputsRaw) {
 		var rawOutputs []json.RawMessage
-		if err := json.Unmarshal(raw, &rawOutputs); err != nil {
+		if err := json.Unmarshal(outputsRaw, &rawOutputs); err != nil {
 			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response outputs is not an array", err)
 		}
 		for i, rawOut := range rawOutputs {
@@ -299,32 +352,69 @@ func decodeResponse(data []byte) (*Response, *Error) {
 			}
 			resp.UnknownFields = append(resp.UnknownFields, unknownKeys(m, outputKeys, fmt.Sprintf("outputs[%d].", i))...)
 
-			var outType string
-			if err := json.Unmarshal(m["type"], &outType); err != nil {
-				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].type is not a string", i), err)
+			outType, oerr := decodeStringField(m, "type", fmt.Sprintf("guest response outputs[%d].type", i))
+			if oerr != nil {
+				return nil, oerr
 			}
 			switch outType {
 			case "text":
-				var text string
-				if err := json.Unmarshal(m["text"], &text); err != nil {
-					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].text is not a string", i), err)
+				text, oerr := decodeStringField(m, "text", fmt.Sprintf("guest response outputs[%d].text", i))
+				if oerr != nil {
+					return nil, oerr
 				}
 				resp.Outputs = append(resp.Outputs, Output{Type: "text", Text: text})
 			case "console":
-				var text string
-				if err := json.Unmarshal(m["text"], &text); err != nil {
-					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].text is not a string", i), err)
+				text, oerr := decodeStringField(m, "text", fmt.Sprintf("guest response outputs[%d].text", i))
+				if oerr != nil {
+					return nil, oerr
 				}
-				var level string
-				if rawLevel, ok := m["level"]; ok {
-					if err := json.Unmarshal(rawLevel, &level); err != nil {
-						return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].level is not a string", i), err)
-					}
+				level, oerr := decodeStringField(m, "level", fmt.Sprintf("guest response outputs[%d].level", i))
+				if oerr != nil {
+					return nil, oerr
+				}
+				if !validConsoleLevel(level) {
+					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].level %q is not one of debug, info, warn, error", i, level), nil)
 				}
 				resp.Outputs = append(resp.Outputs, Output{Type: "console", Text: text, Level: level})
+			case "image":
+				mime, oerr := decodeStringField(m, "mime", fmt.Sprintf("guest response outputs[%d].mime", i))
+				if oerr != nil {
+					return nil, oerr
+				}
+				if !validMIME(mime) {
+					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].mime %q is not a valid MIME type", i, mime), nil)
+				}
+				encoded, oerr := decodeStringField(m, "data_base64", fmt.Sprintf("guest response outputs[%d].data_base64", i))
+				if oerr != nil {
+					return nil, oerr
+				}
+				// Bound the decoded allocation by the message-derived safety
+				// bound, never by the public output cap. The encoded frame is
+				// already bounded by MaxMessageBytes; this check makes the
+				// allocation bound explicit before decoding.
+				if maxImageBytes > 0 && base64DecodedLen(encoded) > maxImageBytes {
+					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].data_base64 exceeds %d decoded bytes", i, maxImageBytes), nil)
+				}
+				data, derr := base64.StdEncoding.Strict().DecodeString(encoded)
+				if derr != nil {
+					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("guest response outputs[%d].data_base64 is not valid base64", i), derr)
+				}
+				resp.Outputs = append(resp.Outputs, Output{Type: "image", MIME: mime, Data: data})
 			default:
 				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", fmt.Sprintf("unsupported guest output type %q", outType), nil)
 			}
+		}
+	} else if hasOutput && !isJSONNull(outputRaw) {
+		text, oerr := decodeStringField(top, "output", "guest response output")
+		if oerr != nil {
+			return nil, oerr
+		}
+		resp.Outputs = append(resp.Outputs, Output{Type: "text", Text: text})
+	}
+
+	if raw, ok := top["output_truncated"]; ok && !isJSONNull(raw) {
+		if err := json.Unmarshal(raw, &resp.OutputTruncated); err != nil {
+			return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response output_truncated is not a boolean", err)
 		}
 	}
 
@@ -367,6 +457,49 @@ func decodeResponse(data []byte) (*Response, *Error) {
 				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.line is not an integer", err)
 			}
 		}
+		if rawCause, ok := m["tool_cause"]; ok && !isJSONNull(rawCause) {
+			var cm map[string]json.RawMessage
+			if err := json.Unmarshal(rawCause, &cm); err != nil {
+				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause is not an object", err)
+			}
+			if cm == nil {
+				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause is not an object", nil)
+			}
+			resp.UnknownFields = append(resp.UnknownFields, unknownKeys(cm, toolCauseKeys, "error.tool_cause.")...)
+
+			tc := &ToolCause{}
+			if rawCode, ok := cm["code"]; ok {
+				if err := json.Unmarshal(rawCode, &tc.Code); err != nil {
+					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause.code is not a string", err)
+				}
+			}
+			if tc.Code == "" {
+				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause is missing code", nil)
+			}
+			rawMessage, ok := cm["message"]
+			if !ok {
+				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause is missing message", nil)
+			}
+			if err := json.Unmarshal(rawMessage, &tc.Message); err != nil {
+				return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause.message is not a string", err)
+			}
+			if rawTool, ok := cm["tool"]; ok && !isJSONNull(rawTool) {
+				if err := json.Unmarshal(rawTool, &tc.Tool); err != nil {
+					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause.tool is not a string", err)
+				}
+			}
+			if rawCallID, ok := cm["call_id"]; ok && !isJSONNull(rawCallID) {
+				var id int64
+				if err := json.Unmarshal(rawCallID, &id); err != nil {
+					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause.call_id is not an integer", err)
+				}
+				if id <= 0 {
+					return nil, newError(KindProtocolError, StatusProtocolError, "decode", "", "guest response error.tool_cause.call_id must be positive", nil)
+				}
+				tc.CallID = &id
+			}
+			ex.ToolCause = tc
+		}
 		resp.Exception = ex
 	}
 
@@ -397,6 +530,76 @@ func decodeResponse(data []byte) (*Response, *Error) {
 
 	sort.Strings(resp.UnknownFields)
 	return resp, nil
+}
+
+// decodeStringField decodes a required, non-null string field. Empty strings
+// are allowed; the caller decides whether a particular field must be non-empty.
+func decodeStringField(m map[string]json.RawMessage, key, path string) (string, *Error) {
+	raw, ok := m[key]
+	if !ok || isJSONNull(raw) {
+		return "", newError(KindProtocolError, StatusProtocolError, "decode", "", path+" is missing", nil)
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", newError(KindProtocolError, StatusProtocolError, "decode", "", path+" is not a string", err)
+	}
+	if !utf8.ValidString(s) {
+		return "", newError(KindProtocolError, StatusProtocolError, "decode", "", path+" is not valid UTF-8", nil)
+	}
+	return s, nil
+}
+
+// base64DecodedLen returns the exact decoded length for a standard padded
+// base64 string without allocating the decoded bytes. Invalid input may
+// produce an approximate value; the subsequent strict decode reports the
+// protocol error.
+func base64DecodedLen(encoded string) int {
+	n := base64.StdEncoding.DecodedLen(len(encoded))
+	if strings.HasSuffix(encoded, "==") {
+		n -= 2
+	} else if strings.HasSuffix(encoded, "=") {
+		n--
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+func validConsoleLevel(level string) bool {
+	switch level {
+	case "debug", "info", "warn", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+// validMIME accepts a bare type/subtype token pair. Parameters, whitespace,
+// control characters, and non-ASCII bytes are rejected so a malformed MIME
+// value cannot be surfaced as a real ImageEvent.
+func validMIME(mime string) bool {
+	if mime == "" || len(mime) > 255 {
+		return false
+	}
+	slash := strings.IndexByte(mime, '/')
+	if slash <= 0 || slash == len(mime)-1 {
+		return false
+	}
+	if strings.IndexByte(mime[slash+1:], '/') >= 0 {
+		return false
+	}
+	for i := 0; i < len(mime); i++ {
+		c := mime[i]
+		if c <= 0x20 || c >= 0x7f {
+			return false
+		}
+		switch c {
+		case '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '[', ']', '?', '=':
+			return false
+		}
+	}
+	return true
 }
 
 func unknownKeys(m map[string]json.RawMessage, known map[string]bool, prefix string) []string {

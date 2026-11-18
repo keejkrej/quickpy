@@ -230,6 +230,7 @@ func TestStartMessageInitialState(t *testing.T) {
 		Source:       "s",
 		Filename:     "f",
 		InitialState: raw,
+		MaxToolCalls: -1,
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -237,16 +238,22 @@ func TestStartMessageInitialState(t *testing.T) {
 	if !strings.Contains(string(b), `"initial_state":{"a":1}`) {
 		t.Fatalf("start message = %s", b)
 	}
+	if !strings.Contains(string(b), `"max_tool_calls":-1`) {
+		t.Fatalf("start message = %s", b)
+	}
 
 	raw, werr = encodeInitialState(nil, 1024, "exec-test")
 	if werr != nil {
 		t.Fatalf("encodeInitialState(nil): %v", werr)
 	}
-	b, err = json.Marshal(startMessage{V: 0, Type: "start", Source: "s", Filename: "f", InitialState: raw})
+	b, err = json.Marshal(startMessage{V: 0, Type: "start", Source: "s", Filename: "f", InitialState: raw, MaxToolCalls: 1000})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	if !strings.Contains(string(b), `"initial_state":null`) {
+		t.Fatalf("start message = %s", b)
+	}
+	if !strings.Contains(string(b), `"max_tool_calls":1000`) {
 		t.Fatalf("start message = %s", b)
 	}
 }

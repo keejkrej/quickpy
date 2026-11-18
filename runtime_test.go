@@ -3,7 +3,6 @@ package quickpy
 import (
 	"context"
 	"errors"
-	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -518,6 +517,26 @@ func TestExecuteValidation(t *testing.T) {
 	}
 }
 
+func TestExecuteSourceOverMessageCap(t *testing.T) {
+	r := testRuntime(t, RuntimeOptions{
+		MaxMemoryBytes:  1 << 20,
+		MaxExecutions:   1,
+		MaxSourceBytes:  1 << 20,
+		MaxMessageBytes: 64,
+	}, &fakeEngine{})
+	_, err := r.Execute(context.Background(), ExecuteRequest{
+		Source:   strings.Repeat("#", 100),
+		Filename: "x.py",
+	})
+	var qe *Error
+	if !errors.As(err, &qe) || qe.Kind != KindInvalidRequest {
+		t.Fatalf("got %v, want InvalidRequest", err)
+	}
+	if !strings.Contains(qe.Message, "source exceeds 64 bytes") {
+		t.Fatalf("message = %q", qe.Message)
+	}
+}
+
 func TestExecuteTightensLimits(t *testing.T) {
 	var got engineRequest
 	eng := &fakeEngine{
@@ -628,8 +647,8 @@ func TestExecuteNoToolCallCap(t *testing.T) {
 	if _, err := e.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got.MaxToolCalls != math.MaxInt {
-		t.Fatalf("MaxToolCalls = %d, want math.MaxInt", got.MaxToolCalls)
+	if got.MaxToolCalls != -1 {
+		t.Fatalf("MaxToolCalls = %d, want -1 (unlimited)", got.MaxToolCalls)
 	}
 }
 

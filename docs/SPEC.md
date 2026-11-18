@@ -1,7 +1,7 @@
 # QuickPy Technical Specification
 
 **Status:** M1 implementation, not stable / v0.1
-**Scope:** This document defines the intended contract and architecture. M0 feasibility is complete and independently verified (see `cmd/quickpy-spike/README.md` and `guest/M0_NOTES.md` for build hashes, commands, and measurements). The M1 public SDK + persistence increment is integration-tested but not a full M1 acceptance or release. Nothing here should be read as a claim of a finished public SDK, production hardening, full M1 acceptance, or pi-go integration. Support is explicitly experimental.
+**Scope:** This document defines the intended contract and architecture. M0 feasibility is complete and independently verified (see `cmd/quickpy-spike/README.md` and `guest/M0_NOTES.md` for build hashes, commands, and measurements). M1 is accepted as a milestone (independent verification, 2026-11-18). Nothing here should be read as a claim of production GA, a stable 1.0 API, CPython compatibility, or pi-go integration. Support is explicitly experimental.
 
 ---
 
@@ -26,7 +26,7 @@ The M0 spike currently uses a **C** guest adapter as a pragmatic shortcut to pro
 - A native C ABI in the first iteration.
 - Live VM snapshots.
 - JavaScript/QuickJS semantics disguised as Python semantics.
-- A production-ready SDK, production hardening, or M1 completion. M0 is a verified feasibility baseline; see Section 16.
+- A production-ready SDK, production hardening, or a stable 1.0 API. M0 and M1 are verified milestones; see Section 16.
 
 ---
 
@@ -170,7 +170,8 @@ The following existing behavior is the reference, adapted to Python:
 This section describes the **M1 implementation**. Names are now concrete in the
 root `quickpy` package, but the API is **pre-1.0** and may still change. The
 semantics here are normative unless a status deviation is listed in
-[`M1_STATUS.md`](M1_STATUS.md). M1 is not accepted as a full release yet.
+[`M1_STATUS.md`](M1_STATUS.md). M1 is accepted as a milestone; the API remains
+pre-1.0.
 
 ### 6.1 Core types
 
@@ -335,7 +336,7 @@ type Result struct {
 | `ScriptError` | Guest raised an uncaught Python exception | `Failed` | N/A (it is the exception) |
 | `TimedOut` | Execution timeout exceeded | `TimedOut` | No |
 | `Cancelled` | Explicit cancel or parent context cancellation | `Cancelled` | No |
-| `LimitExceeded` | Configured memory, output, message, pending-call, resume, or tool-result limit hit; state limit detected at finalization | `LimitExceeded` | Sometimes catchable before hard abort; see 6.6.1 |
+| `LimitExceeded` | Configured output, message, pending-call, resume, or tool-result limit hit; host compile/instantiate memory-limit error; state limit detected at finalization | `LimitExceeded` | Sometimes catchable before hard abort; see 6.6.1 |
 | `Stalled` | Guest cannot progress: no runnable work, no awaiting calls, no timers, not complete | `Stalled` | No |
 | `GuestFault` | WASM trap not attributable to a configured limit, internal guest fault | `Failed` | No |
 | `HostFault` | Recovered panic or internal bug in the host adapter/tool dispatch | `Failed` | No |
@@ -389,7 +390,8 @@ Host tool mistakes are distinct from script failures:
 | Condition | Python-visible | Terminal `Kind` |
 |---|---|---|
 | Guest heap allocation fails and the VM can raise | catchable `MemoryError` | none if caught; `ScriptError` if uncaught |
-| Configured guest heap/WASM memory cap hit and cannot be raised | none | `LimitExceeded` |
+| Configured runtime memory cap hit during guest allocation (`memory.grow` returns `-1`) | catchable `MemoryError` | none if caught; `ScriptError` if uncaught (ADR-0001) |
+| Host compile/instantiate resource-limit error | none | `LimitExceeded` |
 | Unattributed guest OOM or trap | none | `GuestFault` |
 | Output cap exceeded | none (hard abort) | `LimitExceeded` |
 | Source exceeds `MaxSourceBytes` | none (pre-execution) | `InvalidRequest` |
@@ -406,7 +408,7 @@ Host tool mistakes are distinct from script failures:
 | Configured protocol message cap exceeded | none | `LimitExceeded` |
 | Arbitrary WASM trap | none | `GuestFault` |
 
-Partial outputs are retained on every terminal error. State is never committed on error, including `LimitExceeded` during finalization. `GuestFault` is reserved for traps not attributable to a configured limit; configured memory exhaustion is `LimitExceeded`, not `GuestFault`.
+Partial outputs are retained on every terminal error. State is never committed on error, including `LimitExceeded` during finalization. `GuestFault` is reserved for traps not attributable to a configured limit. A configured runtime memory cap hit during guest allocation is guest-visible (`MemoryError`, or `ScriptError` if uncaught), not `LimitExceeded`; host compile/instantiate memory-limit errors are `LimitExceeded`. See [ADR-0001](adr/0001-guest-allocation-failures.md).
 
 ### 6.7 Tool call semantics
 
@@ -660,7 +662,7 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 ### 13.3 Resource limits
 
 - **Time:** execution timeout enforced via context. While `Running`, cancellation is host-led forced termination using wazero `CloseOnContextDone`; the host waits for the active entry to return and classifies from the latched cause. No guest interrupt export is required. While `Suspended`, cooperative `abort` is the intended path; the M0 guest does not implement it, so forced close is used.
-- **Memory:** `MaxMemoryBytes` is required and is applied at the wazero runtime level; the current engine does not enforce a separate per-instance cap. A per-execution `MaxMemoryBytes` must be zero (inherit) or exactly equal to the runtime value; a tighter value is rejected with `InvalidRequest`. A configured cap hit is `LimitExceeded`; a catchable `MemoryError` is possible only when the VM can still raise. Unattributed OOM/traps are `GuestFault`. QuickPy bounds guest linear memory, not all host memory; hosts must budget wazero overhead and tool handlers.
+- **Memory:** `MaxMemoryBytes` is required and is applied at the wazero runtime level; the current engine does not enforce a separate per-instance cap. A per-execution `MaxMemoryBytes` must be zero (inherit) or exactly equal to the runtime value; a tighter value is rejected with `InvalidRequest`. A configured cap hit during guest allocation is guest-visible as a catchable `MemoryError` (or `ScriptError` if uncaught), because wazero's `memory.grow` returns `-1` to the guest rather than trapping; host compile/instantiate memory-limit errors are `LimitExceeded`. Unattributed OOM/traps are `GuestFault`. See [ADR-0001](adr/0001-guest-allocation-failures.md). QuickPy bounds guest linear memory, not all host memory; hosts must budget wazero overhead and tool handlers.
 - **Stack:** guest recursion/stack limit enforced by MicroPython configuration or the adapter; overflow becomes a catchable `RecursionError` where possible, else `LimitExceeded` if a stack cap is configured, otherwise `GuestFault`.
 - **Output:** total output bytes, per-message size, per-tool-result size, state size.
 - **Calls:** `MaxToolCalls`, `MaxConcurrentToolCalls`, `MaxPendingCalls`, and `MaxResumes` are configured defaults and are enforced. Exceeding `MaxToolCalls` raises catchable `ToolLimitError`; exceeding `MaxPendingCalls` or `MaxResumes` is `LimitExceeded`.
@@ -679,7 +681,7 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 
 ## 14. Compatibility and versioning
 
-- **Guest protocol:** integer major/minor version, checked via `qp_abi_version()` during startup. The current host requires **ABI 2** (packed 0.2) and rejects 0.1 artifacts with a protocol/ABI error rather than silently losing initial state. A future minor mismatch is accepted only if the Go SDK declares support.
+- **Guest protocol:** integer major/minor version, checked via `qp_abi_version()` during startup. The current host requires **ABI 4** (packed 0.4) and rejects older artifacts with a protocol/ABI error rather than silently losing state, tool caps, or structured output. A future minor mismatch is accepted only if the Go SDK declares support.
 - **Artifact:** embeds engine name/version and protocol version; `Result.Guest` reports them for diagnostics. `GuestInfo.Version` is currently blank (see [`M1_STATUS.md`](M1_STATUS.md)).
 - **Python compatibility:** the language is "MicroPython subset", not CPython. Document supported syntax/modules, known deviations, and the exact MicroPython pin. `sys.version` must identify the engine honestly.
 - **SDK API stability:** pre-1.0, names may change. Semantics in this document (lifecycle, isolation, error taxonomy, value rules) are the compatibility target.
@@ -690,7 +692,7 @@ Initial payloads are JSON-like only. This is a deliberate capability and complex
 
 ## 15. Conformance and testing strategy
 
-M0 acceptance is complete and independently verified. The M1 public SDK + persistence increment now has a permanent real-artifact integration suite in [`../integration/`](../integration/), documented in [`../integration/README.md`](../integration/README.md). Current evidence tiers are: **guest smoke** (66 checks against the real artifact, 41 M0 + 25 M1), **host synthetic** (Go unit tests, including the public root package and the low-level `internal/wasmguest` suite), and **real-artifact public integration** (40 top-level tests plus 14 subtests, ~7.9 s; race run ~40.3 s; skips cleanly when `QUICKPY_TEST_ARTIFACT` is unset). These integration results are worker-reported; independent verification is being started. The suite covers state rollback, events/order/truncation, tool float fidelity, registry snapshot/retention, repeated wait/wait-local timeout, close running/suspended/short-context/noncooperative, 100 sequential and 10 concurrent executions, empty imports/security, and per-execution memory rejection. Remaining gaps are request-specific caps not all exercised with the real artifact, real protocol/guest-fault coverage, a normative `asyncio` matrix, and a dedicated soak/resource-leak trend. Items already covered by M0 evidence are noted in Section 16; current M1 pieces and open gates are tracked in [`M1_STATUS.md`](M1_STATUS.md).
+M0 and M1 acceptance are complete and independently verified. The M1 public SDK + persistence increment has a permanent real-artifact integration suite in [`../integration/`](../integration/), documented in [`../integration/README.md`](../integration/README.md). Current evidence tiers are: **guest smoke** (118 checks against the real artifact, 41 M0 + 77 M1), **host synthetic** (Go unit tests, including the public root package and the low-level `internal/wasmguest` suite), and **real-artifact public integration** (72 top-level tests plus 74 subtests, ~15.4 s; race run 110.2 s; skips cleanly when `QUICKPY_TEST_ARTIFACT` is unset). The independent verifier reported GO on all 12 M1 criteria. The suite covers state rollback, events/order/truncation including console and image output, tool float fidelity, distinct tool error classes and trailing `ToolCause`, registry snapshot/retention, repeated wait/wait-local timeout, close running/suspended/short-context/noncooperative, 100 sequential and 10 concurrent executions, empty imports/security, per-execution memory rejection, request caps, the `asyncio` matrix, and the opt-in soak. Current M1 pieces, limits, and accepted constraints are tracked in [`M1_STATUS.md`](M1_STATUS.md).
 
 1. **Value conformance:** round-trip matrix for null/bool/int boundaries/float edges/strings (including Unicode and rejected surrogates)/nested containers; rejection of NaN, Inf, int overflow, cycles, non-string keys, unsupported types, depth/size overflow; DAG duplication; int/float distinction.
 2. **Protocol conformance:** ABI handshake, unknown message, duplicate response, unknown call ID, oversized frame, truncated frame, malformed JSON, sequence mismatch, ledger transitions, duplicate guest call IDs, partial response delivery, no redispatch after later suspensions, and tombstone behavior. All must produce a structured error, not a hang or panic.
@@ -739,15 +741,19 @@ M0 could have failed; a failure would have been a valid outcome that redirects t
 
 ### M1 — SDK MVP
 
-**Status: coherent public SDK + persistence increment, integration-tested; not
-a full M1 acceptance or release.** The checklist below is the acceptance target,
-not a claim that every item is done. The permanent real-artifact integration
-suite is worker-reported passing (40 top-level tests plus 14 subtests, ~7.9 s;
-race run ~40.3 s) and skips cleanly without `QUICKPY_TEST_ARTIFACT`; independent
-verification is being started. Current coverage, the capacity-race regression
-that was found and fixed, and open gates are tracked in
-[`M1_STATUS.md`](M1_STATUS.md); do not read an unchecked item as either passed
-or failed without checking that page.
+**Status: full M1 accepted (independent verification, 2026-11-18).** All 12
+exit criteria below pass against the real artifact. The final reference artifact
+is ABI 4, **236,119 bytes**, SHA-256
+`171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`, with zero
+WASI imports, one EH tag, 64/1024 memory pages, and a 4 MiB guest heap; a
+clean-directory rebuild was byte-identical. Independent evidence: 72 top-level
+integration tests plus 74 subtests (~15.4 s; race 110.2 s), 118/118 guest smoke
+checks, 78/78 instances closed, 58 root tests, 126 internal tests total, and an
+opt-in soak of 1060 executions in 27.84 s with zero errors and stable
+goroutines. This is a milestone acceptance, not production GA, a stable 1.0 API,
+CPython compatibility, or full Prime compatibility. Current pieces, limits, and
+accepted constraints are tracked in [`M1_STATUS.md`](M1_STATUS.md); the proposed
+post-M1 direction is [`AGENT_TARGET.md`](AGENT_TARGET.md).
 
 Exit criteria:
 

@@ -1,53 +1,116 @@
 # QuickPy M1 status
 
-**Status:** the current `m1/public-sdk` increment is a **coherent public SDK +
-persistence increment, integration-tested against the real artifact**. It is
-**not a full M1 acceptance or release**. This page records what the increment
-contains and which gates remain. It does not change the historical M0 record in
-[`../guest/M0_NOTES.md`](../guest/M0_NOTES.md) or the M0 verdict in
-[`SPEC.md`](SPEC.md) §16.
+**Status: full M1 accepted (independent verification, 2026-11-18).** All 12 M1
+exit criteria in [`SPEC.md`](SPEC.md) §16 pass against the real artifact. This
+is a milestone acceptance, **not** production GA, a stable 1.0 API, CPython
+compatibility, or full Prime compatibility. The post-M1 direction is the
+proposed compiled-agent target in [`AGENT_TARGET.md`](AGENT_TARGET.md); it is
+not current scope.
 
-**Independent verification (2026-11-18): GO, no blockers.** The verifier
-reproduced the real artifact byte-identically, ran the default and race suites,
-and repeated the real-artifact integration three times. This is a GO for
-publishing the increment as a single PR from `m1/public-sdk`; it is **not** a
-full M1 acceptance or production-readiness verdict. See
-[`HANDOFF.md`](HANDOFF.md) §9 for the current publication pointer.
+## Final independent verification
+
+The independent verifier reported **GO on all 12 M1 exit criteria** with no
+blocking issues. The only stale item was documentation, which this page and the
+linked docs now resolve.
+
+- **Artifact:** **236,119 bytes**, SHA-256
+  `171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`.
+  ABI **4**, MicroPython **1.29.0**, protocol envelope **0**, **zero** WASI
+  imports, **1** EH tag, initial memory **64** pages, maximum **1024** pages,
+  guest heap **4 MiB**. A clean-directory rebuild was byte-identical and the
+  exports were unchanged.
+- **Real guest:** **118/118** checks pass; **78/78** instances closed. The
+  smoke RSS observation of ~69–72 MiB after the harness fix is historical and
+  run-specific, not a per-instance guarantee.
+- **Independent full tests:** **72 top-level PASS** plus `TestSoak` default skip
+  (**73 top-level total**) and **74 subtests**; real integration **~15.4 s**,
+  then `-race` **110.2 s**. Root tests: **58**. Internal: **126 total** (the
+  verifier reports 126; use `go test -list` if a test/fuzz split is needed).
+- **Soak (opt-in):** **1060 executions** in **27.84 s**, **0 errors**,
+  goroutines **2/2**, RSS around **360 MiB** and stable on the reference
+  machine. See [`../integration/SOAK.md`](../integration/SOAK.md) for the batch
+  explanation. This is a process-level observation, not a per-instance memory
+  guarantee.
+- **Go gates:** `gofmt`, `go vet`, `go build`, default tests, and default-race
+  pass. Repeat async/lifecycle runs passed **3×**.
 
 ## Current pieces
 
 | Piece | Current state | Evidence tier |
 |---|---|---|
 | Public root package (`quickpy`) | `New`, `RuntimeOptions`, `ArtifactSource`, `RegisterTool`/`UnregisterTool`/`ToolNames`, `Execute`, `Execution.Wait`/`Cancel`/`ID`, `Close`, `Value`, `ToolCall`/`ToolHandler`/`ToolError`, `Event`/`TextEvent`/`ConsoleEvent`/`ImageEvent`/`ToolEvent`, `Result`, `Status`, `Error`/`Kind`, `GuestInfo` | Code + unit tests |
-| Public root tests | **48 test functions** pass, including the race suite | Independent verification GO (2026-11-18) |
-| Low-level host (`internal/wasmguest`) | ABI 2 handshake, start/response protocol, tool dispatch, value codec, state decode, observer, cancellation, close | Code + unit tests |
-| Low-level tests | **83 test functions + 1 fuzz target = 84** | Independent verification GO (2026-11-18) |
-| Public real-artifact integration | **40 top-level tests + 14 subtests PASS**, ~7.9 s; race run PASS, ~40.3 s; **3 repeat runs PASS** | Independent verification GO (2026-11-18) |
+| Public root tests | **58** test functions pass, including the race suite | Independent verification GO (2026-11-18) |
+| Low-level host (`internal/wasmguest`) | ABI 4 handshake, protocol envelope 0, tool dispatch, value codec, state decode, observer, cancellation, close, structured outputs | Code + unit tests |
+| Low-level tests | **126 total** (test/fuzz split via `go test -list`) | Independent verification GO (2026-11-18) |
+| Public real-artifact integration | **72 top-level PASS + `TestSoak` default skip (73 total) + 74 subtests**, ~15.4 s; `-race` 110.2 s | Independent verification GO (2026-11-18) |
 | Integration skip behavior | Skips cleanly when `QUICKPY_TEST_ARTIFACT` is unset | Independent verification GO (2026-11-18) |
-| Guest state slice | `quickpy.get_state()` / `set_state()`, catchable `StateError`, last-write-wins, commit only on `completed`, IEEE 754 binary64 floats, ABI 2 | Real artifact smoke |
-| Guest smoke | **66/66 checks** pass (41 M0 + 25 M1), including persistence, IEEE double, and zero WASI imports | Independent verification GO (2026-11-18) |
-| Artifact | **220,134 bytes**, sha256 `be1b8e48b6884e3e9e2a59c758a2abceac564adb5162b691e5a6b6cd3eac9c4d`; **byte-identical rebuild** | Independent verification GO (2026-11-18) |
-| Guest memory | initial **64 pages / 4 MiB**, maximum 1024 pages / 64 MiB; MicroPython heap 4 MiB | Real artifact |
+| Guest state and output slice | `get_state`/`set_state`, catchable `StateError`, last-write-wins, commit only on `completed`, IEEE 754 binary64, ABI 4 console/image outputs, distinct tool error classes, engine identity | Real artifact smoke |
+| Guest smoke | **118/118 checks** pass; **78/78 instances closed** | Independent verification GO (2026-11-18) |
+| Artifact | **236,119 bytes**, SHA-256 `171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`; byte-identical clean-directory rebuild | Independent verification GO (2026-11-18) |
+| Guest memory | initial **64 pages / 4 MiB**, maximum **1024 pages / 64 MiB**; MicroPython heap **4 MiB** | Real artifact |
 | WASI imports | **0** | Real artifact |
+| Protocol envelope | **0** (ABI integer is the capability gate) | Real artifact |
 
-The independent verifier reproduced the full default and race root and internal
-commands, the real-artifact integration suite, and three repeat integration
-runs. The artifact rebuilt byte-identically at the size and hash above. No
-blocking issues were reported.
+## M1 exit criteria
 
-The old M0 artifact metrics (195,053 bytes, 100-page suspended memory, ~0.193 ms
-warm start) are **stale** for the M1 artifact and must not be quoted as current.
-The current guest uses a 4 MiB heap and 4 MiB initial linear memory; M0
-startup/RSS measurements must not be reused blindly, and new M1 memory
-measurements are not yet recorded here.
+All 12 criteria in [`SPEC.md`](SPEC.md) §16 pass:
+
+1. **Public Go contract** — implemented for `Runtime`, `RegisterTool`,
+   `Execute`, `Execution.Wait`/`Cancel`, `Close`, events, results, and errors.
+2. **Conformance suites against the real artifact** — value, protocol,
+   execution semantics, async tools, lifecycle, limits, and stall detection
+   pass.
+3. **Fresh globals / retained tools** — 100 sequential executions with no
+   observable resource growth.
+4. **Ten concurrent executions** — distinct globals and tools complete
+   correctly.
+5. **State commit only on success** — failed, cancelled, timed-out, stalled,
+   and limited runs leave prior state untouched.
+6. **Output ordering and truncation** — deterministic and tested, including
+   text, console, and image events.
+7. **`Close`** — idempotent; in-flight executions terminate; no SDK-owned
+   goroutine or instance leaks in tests.
+8. **Security assertions** — default-deny imports, no host filesystem/network
+   access, no stdout/stderr leakage, and the exact WASI allowlist tested.
+9. **Documentation** — supported Python subset, deviations, limits, and error
+   kinds are documented.
+10. **Normative `asyncio` subset and failure matrix** — documented in
+    [`../integration/ASYNCIO.md`](../integration/ASYNCIO.md) and tested.
+11. **Call-ledger conformance** — partial delivery, duplicate/unknown/late
+    responses, tombstones, and no redispatch.
+12. **6.6.1 resource/trap matrix** — covered by tests, including `StateWritten`
+    and `ErrWaitTimeout` behavior.
+
+The previously open items are now verified: trailing `ToolCause`, engine
+version, distinct `ToolNotFoundError`/`ToolArgumentError`/`ToolLimitError`
+classes, real remaining request caps, the `asyncio` matrix, the soak trend, and
+full text/console/image output. ADR-0001 records the accepted memory
+classification; there is no remaining target mismatch.
+
+## Structured output and limits
+
+These are the current M1 limits. See
+[`../guest/M1_NOTES.md`](../guest/M1_NOTES.md) for the guest-side details.
+
+- **Console text** is emitted without a trailing newline.
+- **Images** are raw **1 MiB per image and 1 MiB total** in the guest; the
+  base64 response can reach up to **2.4 MiB**.
+- **Public `MaxMessageBytes` defaults** may reject an oversized but otherwise
+  valid frame explicitly as `LimitExceeded`; the implementation does not
+  silently pretend a larger frame works.
+- **Guest text** is clipped at **1 MiB** with a truncation flag; output events
+  are sensitive to the **1024**-event bound.
+- A valid image over the output cap is decoded safely under `MaxMessageBytes`,
+  then clipped and reported as `LimitExceeded`, not `ProtocolError`. Invalid
+  base64 and malformed image frames are `ProtocolError`.
+- Public cap `0` means inherit; there is no test that treats a literal `0` as a
+  one-byte cap. The smallest explicit cap is `1`.
 
 ## Integration suite
 
 The permanent suite lives in [`../integration/`](../integration/) and is
 documented in [`../integration/README.md`](../integration/README.md). It is
 gated so a plain `go test ./...` never needs the guest artifact.
-
-Exact gate commands:
 
 ```sh
 # Default run: integration tests skip cleanly.
@@ -58,6 +121,10 @@ QUICKPY_TEST_ARTIFACT=guest/build/quickpy.wasm go test -count=1 -v ./integration
 
 # Real artifact under the race detector.
 QUICKPY_TEST_ARTIFACT=guest/build/quickpy.wasm go test -count=1 -race ./integration
+
+# Opt-in soak/resource evidence.
+QUICKPY_TEST_ARTIFACT=guest/build/quickpy.wasm QUICKPY_SOAK=1 \
+  go test -count=1 -run TestSoak -v ./integration
 ```
 
 Covered by the permanent integration suite (independently verified PASS):
@@ -65,11 +132,11 @@ Covered by the permanent integration suite (independently verified PASS):
 - Initial and final state, including all rollback cases: script error, stall,
   cancel, timeout, and final oversize; `set_state(None)` vs no write; deep copy
   and no mutable alias; nested JSON; int/float identity.
-- Events, ordering, and truncation: ordered `TextEvent`/`ToolEvent` through both
-  the request sink and `Result.Outputs`, out-of-order `asyncio.gather`,
-  deterministic output truncation, and no synthetic console/image events.
-- Tool float fidelity, handler arguments/deadlines, unknown tools, catchable
-  handler errors, and opaque call IDs.
+- Ordered `TextEvent`/`ConsoleEvent`/`ImageEvent`/`ToolEvent` delivery through
+  both the request sink and `Result.Outputs`, out-of-order `asyncio.gather`,
+  deterministic output truncation, and single/cumulative oversized images.
+- Tool float fidelity, handler arguments/deadlines, unknown tools, distinct
+  catchable tool error classes, trailing `ToolCause`, and opaque call IDs.
 - Registry snapshot stability, deterministic `ToolNames`, and tool retention
   across fresh guest globals.
 - Repeated/concurrent `Wait`, wait-local `ErrWaitTimeout` without cancellation,
@@ -82,6 +149,7 @@ Covered by the permanent integration suite (independently verified PASS):
 - Empty guest imports, unavailable `os`/`uos`/`gc`/`math` modules, and no guest
   stdout leak to the host process.
 - Per-execution memory lower-than-runtime rejection before admission.
+- The opt-in soak workload: 1060 executions, zero errors, stable goroutines.
 
 ## Regression found and fixed
 
@@ -128,62 +196,37 @@ tests. They are pre-1.0 and not a stability promise.
   part of the contract.
 - **`DefaultTimeout == 0`:** means no default timeout, as the spec allows; there
   is no hidden 30-second default.
-- **ABI 2 required:** the host requires ABI 2 and rejects 0.1 artifacts rather
-  than silently losing initial state.
+- **ABI 4 required:** the host requires ABI 4 and rejects older artifacts rather
+  than silently losing state, tool caps, or structured output.
 
-## Known deviations from SPEC targets
+## Accepted classifications and nonblocking notes
 
-These are current implementation constraints, recorded honestly. They do not
-rewrite the normative SPEC targets; the SPEC remains the target contract.
+- **Accepted classification (not a deviation):** a configured runtime memory cap
+  hit during guest allocation is guest-visible as `MemoryError` (or
+  `ScriptError` if uncaught), not `LimitExceeded`; arbitrary traps remain
+  `GuestFault`, and host compile/instantiate memory-limit errors are
+  `LimitExceeded`. This is the accepted contract in
+  [ADR-0001](adr/0001-guest-allocation-failures.md), not a pending bug. The
+  SPEC §6.6.1 row matches it.
+- **Nonblocking future-engine robustness notes:** a future engine may need an
+  explicit state-commit status check and a bounded response buffer at instance
+  close. The current implementation is unchanged; these are not blockers for
+  M1.
 
-- **Distinct tool error classes:** SPEC names `ToolNotFoundError`,
-  `ToolArgumentError`, and `ToolLimitError` as distinct Python-visible classes.
-  The current guest exposes a single `quickpy.ToolError` with a `code` field
-  (for example `tool_not_found`). A `MaxToolCalls` overrun is currently
-  classified by the host as `LimitExceeded`, not as a catchable
-  `ToolLimitError`. The SPEC target is unchanged; this is an implementation gap
-  to close before full M1 acceptance.
-- **Runtime WASM cap trap:** a trap caused by the runtime-level WASM memory cap
-  currently maps to `GuestFault`, not `LimitExceeded`, because the host cannot
-  attribute the trap to a configured per-execution limit at that boundary. The
-  SPEC classification target is unchanged.
-- **Nonblocking future-engine robustness notes:** the verifier noted that a
-  future engine may need an explicit state-commit status check and a bounded
-  response buffer at instance close. The current implementation is unchanged;
-  these are not blockers for this increment.
+## Accepted constraints and post-M1 non-goals
 
-## Open M1 gates
+Full M1 acceptance is a milestone verdict, not production GA, a stable 1.0 API,
+CPython compatibility, or full Prime compatibility.
 
-- Request-specific `MaxSourceBytes`, `MaxToolCalls`, `MaxPendingCalls`,
-  `MaxResumes`, and tool-result caps are not all covered with the real artifact;
-  synthetic tests cover some.
-- Real protocol/guest-fault coverage is synthetic.
-- An uncaught structured `ToolCause` is **not populated** on `Error.Tool` yet.
-- `GuestInfo.Version` is **blank** even though the type has the field.
-- `ConsoleEvent` and `ImageEvent` are exposed types, but the real guest does not
-  yet emit console or image output; only text output is produced. The image
-  types are documentation/API surface only for now.
-- No per-instance memory enforcement; `MaxMemoryBytes` is runtime-level only,
-  and a lower per-execution value is rejected rather than applied.
-- No host wall-clock timers and no top-level `await`/`return`.
-- Imports and frozen modules remain narrow.
-- No stable artifact distribution/embedding contract yet.
-- A complete normative `asyncio` subset/failure matrix is still needed.
-- A dedicated soak/resource-leak trend is still needed. The basic close
-  scenarios are covered; comprehensive close-under-load maturity is deferred.
+- No host wall-clock timers; no top-level `await` or top-level `return`.
+- Narrow MicroPython module surface; no ambient `os`, `open`, filesystem,
+  network, or environment access.
+- Per-execution memory below the runtime cap is rejected, not applied.
+- Output is observed when a guest invocation returns, not streamed during a
+  long-running yield-free C/Python section.
+- OS wrappers are future `AgentScript` work and remain default-deny.
+- Stable artifact distribution/embedding is future packaging work, not silently
+  claimed complete.
 - No pi-go integration and no Zig rewrite.
-- Execution event streaming happens when a guest invocation returns, not during
-  a long-running yield-free C/Python section.
-
-## What is still needed for full M1 acceptance
-
-1. ~~Independent verification of the integration and race results.~~ **Done:
-   independent verification GO, 2026-11-18.**
-2. Real-artifact coverage for the remaining request-specific caps and real
-   protocol/guest-fault cases.
-3. A normative supported `asyncio` subset and failure matrix.
-4. A dedicated soak/resource-leak trend.
-5. Resolution or explicit acceptance of the deviations above.
-6. A committed, reviewed, and published M1 branch/PR.
-
-Until those land, M1 is **not accepted as a full release**.
+- The proposed post-M1 compiled-agent direction is
+  [`AGENT_TARGET.md`](AGENT_TARGET.md); it is not current scope.

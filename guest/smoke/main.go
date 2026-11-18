@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -24,19 +25,38 @@ type call struct {
 	Args map[string]any `json:"args"`
 }
 
+// output is one ordered structured output entry.  The guest emits text,
+// console, and image entries in emission order.
+type output struct {
+	Type       string `json:"type"`
+	Text       string `json:"text"`
+	Level      string `json:"level"`
+	MIME       string `json:"mime"`
+	DataBase64 string `json:"data_base64"`
+}
+
 type response struct {
-	V        int     `json:"v"`
-	Type     string  `json:"type"`
-	Reason   string  `json:"reason"`
-	Stalled  bool    `json:"stalled"`
-	Calls    []call  `json:"calls"`
-	Awaiting []int64 `json:"awaiting"`
-	Output   string  `json:"output"`
+	V        int      `json:"v"`
+	Type     string   `json:"type"`
+	Reason   string   `json:"reason"`
+	Stalled  bool     `json:"stalled"`
+	Calls    []call   `json:"calls"`
+	Awaiting []int64  `json:"awaiting"`
+	Output   string   `json:"output"`
+	Outputs  []output `json:"outputs"`
 	Error    *struct {
 		Type      string `json:"type"`
 		Message   string `json:"message"`
 		Traceback string `json:"traceback"`
+		ToolCause *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Tool    string `json:"tool"`
+			CallID  *int64 `json:"call_id"`
+		} `json:"tool_cause"`
 	} `json:"error"`
+	EngineName    string `json:"engine_name"`
+	EngineVersion string `json:"engine_version"`
 	// StateWritten is a pointer so the harness can distinguish an absent
 	// field (failed/suspended responses) from an explicit false (completed
 	// with no set_state call).
@@ -50,25 +70,56 @@ type instance struct {
 	free   api.Function
 	invoke api.Function
 	mem    api.Memory
+	closed bool
+}
+
+// Harness ownership model: scenarios run sequentially, so newInstance closes
+// the previous scenario's module before instantiating the next one.  This keeps
+// at most one guest module alive at a time and makes the harness RSS reflect
+// the SDK's per-execution footprint rather than accumulated leaked instances.
+// The final instance is closed by the defer in main before the runtime closes.
+var (
+	currentInstance  *instance
+	instancesCreated int
+	instancesClosed  int
+)
+
+func (i *instance) Close(ctx context.Context) {
+	if i == nil || i.closed {
+		return
+	}
+	i.closed = true
+	instancesClosed++
+	_ = i.mod.Close(ctx)
 }
 
 func newInstance(ctx context.Context, r wazero.Runtime, wasm []byte) (*instance, error) {
+	// Close the previous scenario's module first.  No scenario uses an older
+	// instance after creating a new one.
+	if currentInstance != nil {
+		currentInstance.Close(ctx)
+		currentInstance = nil
+	}
 	mod, err := r.Instantiate(ctx, wasm)
 	if err != nil {
 		return nil, err
 	}
 	if init := mod.ExportedFunction("_initialize"); init != nil {
 		if _, err := init.Call(ctx); err != nil {
+			_ = mod.Close(ctx)
 			return nil, fmt.Errorf("_initialize: %w", err)
 		}
 	}
-	return &instance{
+	inst := &instance{
 		mod:    mod,
 		alloc:  mod.ExportedFunction("qp_alloc"),
 		free:   mod.ExportedFunction("qp_free"),
 		invoke: mod.ExportedFunction("qp_invoke"),
 		mem:    mod.Memory(),
-	}, nil
+	}
+	instancesCreated++
+	currentInstance = inst
+	return inst, nil
 }
 
 func (i *instance) invokeJSON(ctx context.Context, request string) (response, error) {
@@ -108,21 +159,34 @@ func (i *instance) invokeJSON(ctx context.Context, request string) (response, er
 
 func startRequest(source string) string {
 	b, _ := json.Marshal(map[string]any{
-		"v":        0,
-		"type":     "start",
-		"source":   source,
-		"filename": "<smoke>",
+		"v":              0,
+		"type":           "start",
+		"source":         source,
+		"filename":       "<smoke>",
+		"max_tool_calls": -1,
+	})
+	return string(b)
+}
+
+func startRequestWithCap(source string, cap int) string {
+	b, _ := json.Marshal(map[string]any{
+		"v":              0,
+		"type":           "start",
+		"source":         source,
+		"filename":       "<smoke>",
+		"max_tool_calls": cap,
 	})
 	return string(b)
 }
 
 func startRequestWithState(source string, initial any) string {
 	b, _ := json.Marshal(map[string]any{
-		"v":             0,
-		"type":          "start",
-		"source":        source,
-		"filename":      "<smoke>",
-		"initial_state": initial,
+		"v":              0,
+		"type":           "start",
+		"source":         source,
+		"filename":       "<smoke>",
+		"initial_state":  initial,
+		"max_tool_calls": -1,
 	})
 	return string(b)
 }
@@ -142,6 +206,69 @@ func jsonEqual(a, b any) bool {
 	ab, errA := json.Marshal(a)
 	bb, errB := json.Marshal(b)
 	return errA == nil && errB == nil && string(ab) == string(bb)
+}
+
+// engineOK checks the ABI3 engine identity fields.  The version must come from
+// the pinned MicroPython checkout, not a hardcoded date.
+func engineOK(res response) bool {
+	return res.EngineName == "micropython" && res.EngineVersion == "1.29.0"
+}
+
+func describe(res response) string {
+	s := fmt.Sprintf("type=%s output=%q outputs=%d", res.Type, res.Output, len(res.Outputs))
+	if res.Error != nil {
+		s += fmt.Sprintf(" error=%s: %s", res.Error.Type, res.Error.Message)
+		if res.Error.ToolCause != nil {
+			s += fmt.Sprintf(" cause=%s/%s tool=%s", res.Error.ToolCause.Code, res.Error.ToolCause.Message, res.Error.ToolCause.Tool)
+		}
+	}
+	return s
+}
+
+// outputTypes renders the ordered output kinds for failure detail.
+func outputTypes(outputs []output) string {
+	parts := make([]string, 0, len(outputs))
+	for _, o := range outputs {
+		parts = append(parts, o.Type)
+	}
+	return strings.Join(parts, ",")
+}
+
+// textOutputs concatenates only text entries, mirroring the legacy output
+// contract.
+func textOutputs(outputs []output) string {
+	var b strings.Builder
+	for _, o := range outputs {
+		if o.Type == "text" {
+			b.WriteString(o.Text)
+		}
+	}
+	return b.String()
+}
+
+func findOutput(outputs []output, typ string) (output, bool) {
+	for _, o := range outputs {
+		if o.Type == typ {
+			return o, true
+		}
+	}
+	return output{}, false
+}
+
+func decodeBase64(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func toolResponses(responses []map[string]any, gc bool) string {
@@ -211,6 +338,14 @@ func main() {
 		WithCoreFeatures(api.CoreFeaturesV2.SetEnabled(experimental.CoreFeaturesExceptionHandling, true))
 	r := wazero.NewRuntimeWithConfig(ctx, cfg)
 	defer r.Close(ctx)
+	// Close the last scenario's module before the shared runtime.  Defers run
+	// LIFO, so this runs before r.Close.
+	defer func() {
+		if currentInstance != nil {
+			currentInstance.Close(ctx)
+			currentInstance = nil
+		}
+	}()
 
 	a, err := newInstance(ctx, r, wasm)
 	if err != nil {
@@ -227,7 +362,11 @@ func main() {
 	}
 
 	ver, err := a.mod.ExportedFunction("qp_abi_version").Call(ctx)
-	check("abi version", err == nil && uint32(ver[0]) == 2, fmt.Sprintf("err=%v value=%v", err, ver))
+	check("abi version", err == nil && uint32(ver[0]) == 4, fmt.Sprintf("err=%v value=%v", err, ver))
+	check("abi version rejects legacy 0.3", err == nil && uint32(ver[0]) != 3,
+		fmt.Sprintf("err=%v value=%v", err, ver))
+	check("abi version rejects legacy 0.2", err == nil && uint32(ver[0]) != 2,
+		fmt.Sprintf("err=%v value=%v", err, ver))
 	check("abi version rejects legacy 0.1", err == nil && uint32(ver[0]) != 1,
 		fmt.Sprintf("err=%v value=%v", err, ver))
 
@@ -981,6 +1120,666 @@ print(quickpy.get_state())`, nil))
 			res.Error.Type == "StateError" && res.Output == "" &&
 			res.StateWritten == nil && res.State == nil,
 		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// ---------------------------------------------------------------------
+	// M1 conformance: ABI3, tool error classes, tool cap, tool cause, engine.
+	// ---------------------------------------------------------------------
+
+	// ABI3 requires max_tool_calls on every start.  A missing field must be
+	// rejected rather than silently running without the host's cap.
+	missingCap, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate missing cap: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = missingCap.invokeJSON(ctx, `{"v":0,"type":"start","source":"print(1)","filename":"<smoke>"}`)
+	check("abi3 start missing max_tool_calls rejected",
+		err == nil && res.Type == "failed" && res.Error != nil &&
+			res.Error.Type == "ProtocolError" && strings.Contains(res.Error.Message, "max_tool_calls"),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Malformed or out-of-range max_tool_calls values are rejected.
+	for _, raw := range []string{`"1"`, `1.5`, `true`, `-2`} {
+		badCap, ierr := newInstance(ctx, r, wasm)
+		if ierr != nil {
+			fmt.Fprintf(os.Stderr, "instantiate bad cap: %v\n", ierr)
+			os.Exit(1)
+		}
+		req := `{"v":0,"type":"start","source":"print(1)","filename":"<smoke>","max_tool_calls":` + raw + `}`
+		res, err = badCap.invokeJSON(ctx, req)
+		check("abi3 start malformed max_tool_calls "+raw+" rejected",
+			err == nil && res.Type == "failed" && res.Error != nil &&
+				res.Error.Type == "ProtocolError" && strings.Contains(res.Error.Message, "max_tool_calls"),
+			fmt.Sprintf("err=%v response=%+v", err, res))
+	}
+
+	// Engine identity is present on completed, failed, and suspended responses.
+	engDone := fresh()
+	res, err = engDone.invokeJSON(ctx, startRequest(`print("engine")`))
+	check("engine identity completed",
+		err == nil && res.Type == "completed" && engineOK(res),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	engFail := fresh()
+	res, err = engFail.invokeJSON(ctx, startRequest(`raise ValueError("x")`))
+	check("engine identity failed",
+		err == nil && res.Type == "failed" && engineOK(res),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	engSusp := fresh()
+	res, err = engSusp.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    await quickpy.tools.a()
+quickpy.run(main())`))
+	check("engine identity suspended",
+		err == nil && res.Type == "suspended" && engineOK(res),
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// The distinct tool classes are subclasses of ToolError, which is an
+	// Exception, so `except quickpy.ToolError` catches all of them.
+	hier := fresh()
+	res, err = hier.invokeJSON(ctx, startRequest(`import quickpy
+print(issubclass(quickpy.ToolNotFoundError, quickpy.ToolError),
+      issubclass(quickpy.ToolArgumentError, quickpy.ToolError),
+      issubclass(quickpy.ToolLimitError, quickpy.ToolError),
+      issubclass(quickpy.ToolError, Exception))`))
+	check("tool error class hierarchy",
+		err == nil && res.Type == "completed" && res.Output == "True True True True\n",
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// A host tool_not_found response maps to ToolNotFoundError, and the base
+	// ToolError still catches it.  tool/call_id metadata is populated.
+	notFound, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate not found: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = notFound.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    try:
+        await quickpy.tools.missing()
+    except quickpy.ToolError as e:
+        print("base", isinstance(e, quickpy.ToolError), isinstance(e, quickpy.ToolNotFoundError), e.code, e.tool, e.call_id)
+quickpy.run(main())`))
+	check("tool not found setup", err == nil && res.Type == "suspended" && len(res.Calls) == 1,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	if len(res.Calls) == 1 {
+		id := res.Calls[0].ID
+		res, err = notFound.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": id, "ok": false, "error": map[string]any{"code": "tool_not_found", "message": "unknown tool"}},
+		}, false))
+		check("tool not found maps subclass",
+			err == nil && res.Type == "completed" &&
+				res.Output == fmt.Sprintf("base True True tool_not_found missing %d\n", id),
+			fmt.Sprintf("err=%v %s", err, describe(res)))
+	}
+
+	// Positional arguments are rejected as ToolArgumentError before any host
+	// call is registered.
+	positional, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate positional: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = positional.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    try:
+        await quickpy.tools.a(1)
+    except quickpy.ToolArgumentError as e:
+        print("arg", e.code, e.tool, e.call_id)
+quickpy.run(main())`))
+	check("tool positional args rejected",
+		err == nil && res.Type == "completed" && len(res.Calls) == 0 &&
+			res.Output == "arg tool_argument a None\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	// Unsupported argument values are rejected as ToolArgumentError before any
+	// host call is registered.
+	badValue, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate bad value: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = badValue.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    try:
+        await quickpy.tools.a(value=b"bytes")
+    except quickpy.ToolArgumentError as e:
+        print("arg", e.code)
+quickpy.run(main())`))
+	check("tool invalid value rejected",
+		err == nil && res.Type == "completed" && len(res.Calls) == 0 &&
+			res.Output == "arg tool_argument\n",
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// Excessively deep arguments are rejected as ToolArgumentError before any
+	// host call is registered.
+	deepArgs, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate deep args: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = deepArgs.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    v = 1
+    for _ in range(70):
+        v = [v]
+    try:
+        await quickpy.tools.a(value=v)
+    except quickpy.ToolArgumentError as e:
+        print("arg", e.code)
+quickpy.run(main())`))
+	check("tool depth rejected",
+		err == nil && res.Type == "completed" && len(res.Calls) == 0 &&
+			res.Output == "arg tool_argument\n",
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// A cap of 0 allows no host calls at all; the failure is catchable and no
+	// call is generated.
+	capZero, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate cap zero: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = capZero.invokeJSON(ctx, startRequestWithCap(`import asyncio, quickpy
+async def main():
+    try:
+        await quickpy.tools.a(value=1)
+    except quickpy.ToolLimitError as e:
+        print("limit", e.code, e.tool)
+quickpy.run(main())`, 0))
+	check("tool cap 0 blocks all calls",
+		err == nil && res.Type == "completed" && len(res.Calls) == 0 &&
+			res.Output == "limit tool_limit a\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	// A cap of 1 allows the first call and blocks the second before it is
+	// registered, so the host never sees a second call.
+	capOne, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate cap one: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = capOne.invokeJSON(ctx, startRequestWithCap(`import asyncio, quickpy
+async def main():
+    a = await quickpy.tools.a(value=1)
+    print("first", a)
+    try:
+        await quickpy.tools.b(value=2)
+    except quickpy.ToolLimitError as e:
+        print("limit", e.code, e.tool)
+quickpy.run(main())`, 1))
+	check("tool cap 1 first call dispatched",
+		err == nil && res.Type == "suspended" && len(res.Calls) == 1,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	if len(res.Calls) == 1 {
+		res, err = capOne.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": res.Calls[0].ID, "ok": true, "value": "A"},
+		}, false))
+		check("tool cap 1 second blocked",
+			err == nil && res.Type == "completed" && len(res.Calls) == 0 &&
+				res.Output == "first A\nlimit tool_limit b\n",
+			fmt.Sprintf("err=%v %s", err, describe(res)))
+	}
+
+	// -1 means unlimited: a gather of two calls is dispatched normally.
+	unlimited, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate unlimited: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = unlimited.invokeJSON(ctx, startRequestWithCap(`import asyncio, quickpy
+async def main():
+    a, b = await asyncio.gather(quickpy.tools.a(value=1), quickpy.tools.b(value=2))
+    print("gather", a, b)
+quickpy.run(main())`, -1))
+	check("tool unlimited -1 gather",
+		err == nil && res.Type == "suspended" && len(res.Calls) == 2,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	if len(res.Calls) == 2 {
+		res, err = unlimited.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": res.Calls[0].ID, "ok": true, "value": "A"},
+			{"id": res.Calls[1].ID, "ok": true, "value": "B"},
+		}, false))
+		check("tool unlimited -1 completes",
+			err == nil && res.Type == "completed" && strings.Contains(res.Output, "gather A B"),
+			fmt.Sprintf("err=%v response=%+v", err, res))
+	}
+
+	// An uncaught tool failure in a coroutine carries structured cause fields
+	// so the host can populate Error.Tool.
+	uncaught, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate uncaught: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = uncaught.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    await quickpy.tools.a(value=1)
+quickpy.run(main())`))
+	check("uncaught tool setup", err == nil && res.Type == "suspended" && len(res.Calls) == 1,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	if len(res.Calls) == 1 {
+		id := res.Calls[0].ID
+		res, err = uncaught.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": id, "ok": false, "error": map[string]any{"code": "boom", "message": "tool failed"}},
+		}, false))
+		check("uncaught tool cause fields",
+			err == nil && res.Type == "failed" && res.Error != nil &&
+				res.Error.Type == "ToolError" && res.Error.ToolCause != nil &&
+				res.Error.ToolCause.Code == "boom" &&
+				res.Error.ToolCause.Message == "tool failed" &&
+				res.Error.ToolCause.Tool == "a" &&
+				res.Error.ToolCause.CallID != nil && *res.Error.ToolCause.CallID == id,
+			fmt.Sprintf("err=%v response=%+v", err, res))
+	}
+
+	// An uncaught ToolNotFoundError keeps its subclass type and cause code.
+	uncaughtNF, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate uncaught not found: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = uncaughtNF.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    await quickpy.tools.missing()
+quickpy.run(main())`))
+	check("uncaught not found setup", err == nil && res.Type == "suspended" && len(res.Calls) == 1,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	if len(res.Calls) == 1 {
+		res, err = uncaughtNF.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": res.Calls[0].ID, "ok": false, "error": map[string]any{"code": "tool_not_found", "message": "unknown tool"}},
+		}, false))
+		check("uncaught not found cause",
+			err == nil && res.Type == "failed" && res.Error != nil &&
+				res.Error.Type == "ToolNotFoundError" && res.Error.ToolCause != nil &&
+				res.Error.ToolCause.Code == "tool_not_found" &&
+				res.Error.ToolCause.Tool == "missing",
+			fmt.Sprintf("err=%v response=%+v", err, res))
+	}
+
+	// An uncaught argument error from a coroutine carries the tool name but no
+	// call_id, because it never entered dispatch.
+	uncaughtArg, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate uncaught arg: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = uncaughtArg.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    await quickpy.tools.a(1)
+quickpy.run(main())`))
+	check("uncaught argument cause",
+		err == nil && res.Type == "failed" && res.Error != nil &&
+			res.Error.Type == "ToolArgumentError" && res.Error.ToolCause != nil &&
+			res.Error.ToolCause.Code == "tool_argument" &&
+			res.Error.ToolCause.Tool == "a" && res.Error.ToolCause.CallID == nil,
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	// A ToolError raised directly in ordinary source also carries a cause, but
+	// has no tool/call_id because it never entered dispatch.
+	sourceCause, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate source cause: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = sourceCause.invokeJSON(ctx, startRequest(`import quickpy
+raise quickpy.ToolError("source_code", "source message")`))
+	check("uncaught tool cause source",
+		err == nil && res.Type == "failed" && res.Error != nil &&
+			res.Error.Type == "ToolError" && res.Error.ToolCause != nil &&
+			res.Error.ToolCause.Code == "source_code" &&
+			res.Error.ToolCause.Message == "source message" &&
+			res.Error.ToolCause.Tool == "" && res.Error.ToolCause.CallID == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// A non-tool exception must not carry a tool cause.
+	regular, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate regular: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = regular.invokeJSON(ctx, startRequest(`raise ValueError("boom")`))
+	check("regular exception no tool cause",
+		err == nil && res.Type == "failed" && res.Error != nil &&
+			res.Error.Type == "ValueError" && res.Error.ToolCause == nil,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+
+	// A caught tool failure completes normally with no public cause.
+	caught, err := newInstance(ctx, r, wasm)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "instantiate caught: %v\n", err)
+		os.Exit(1)
+	}
+	res, err = caught.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+async def main():
+    try:
+        await quickpy.tools.a()
+    except quickpy.ToolError:
+        print("caught")
+quickpy.run(main())`))
+	check("caught tool setup", err == nil && res.Type == "suspended" && len(res.Calls) == 1,
+		fmt.Sprintf("err=%v response=%+v", err, res))
+	if len(res.Calls) == 1 {
+		res, err = caught.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": res.Calls[0].ID, "ok": false, "error": map[string]any{"code": "boom", "message": "x"}},
+		}, false))
+		check("caught tool failure no public cause",
+			err == nil && res.Type == "completed" && res.Error == nil &&
+				res.Output == "caught\n",
+			fmt.Sprintf("err=%v response=%+v", err, res))
+	}
+
+	// ---------------------------------------------------------------------
+	// ABI4 structured output: console, image, ordering, deltas, caps.
+	// ---------------------------------------------------------------------
+
+	consoleInst := fresh()
+	res, err = consoleInst.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.console.debug("d")
+quickpy.console.info("i", 1)
+quickpy.console.warn("w")
+quickpy.console.error("e")`))
+	check("console levels and text",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 4 &&
+			res.Outputs[0].Type == "console" && res.Outputs[0].Level == "debug" && res.Outputs[0].Text == "d" &&
+			res.Outputs[1].Type == "console" && res.Outputs[1].Level == "info" && res.Outputs[1].Text == "i 1" &&
+			res.Outputs[2].Type == "console" && res.Outputs[2].Level == "warn" && res.Outputs[2].Text == "w" &&
+			res.Outputs[3].Type == "console" && res.Outputs[3].Level == "error" && res.Outputs[3].Text == "e" &&
+			res.Output == "",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	consoleExc := fresh()
+	res, err = consoleExc.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.console.info("x", ValueError("boom"))
+quickpy.console.warn()
+quickpy.console.error("a", 1, None, True)`))
+	check("console exception and empty args",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 3 &&
+			res.Outputs[0].Text == "x boom" &&
+			res.Outputs[1].Text == "" &&
+			res.Outputs[2].Text == "a 1 None True",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	orderInst := fresh()
+	res, err = orderInst.invokeJSON(ctx, startRequest(`import quickpy
+print("a")
+quickpy.console.info("b")
+quickpy.image(b"\x00\x01\xff", mime="image/png")
+print("c")`))
+	img, imgOK := findOutput(res.Outputs, "image")
+	var imgData []byte
+	if imgOK {
+		imgData, _ = decodeBase64(img.DataBase64)
+	}
+	check("output ordering text console image text",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 4 &&
+			res.Outputs[0].Type == "text" && res.Outputs[0].Text == "a\n" &&
+			res.Outputs[1].Type == "console" && res.Outputs[1].Level == "info" && res.Outputs[1].Text == "b" &&
+			res.Outputs[2].Type == "image" && res.Outputs[2].MIME == "image/png" &&
+			res.Outputs[3].Type == "text" && res.Outputs[3].Text == "c\n" &&
+			imgOK && bytesEqual(imgData, []byte{0x00, 0x01, 0xff}),
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+	check("legacy output text only",
+		err == nil && res.Output == "a\nc\n" && textOutputs(res.Outputs) == res.Output,
+		fmt.Sprintf("output=%q text=%q", res.Output, textOutputs(res.Outputs)))
+
+	coalesceInst := fresh()
+	res, err = coalesceInst.invokeJSON(ctx, startRequest(`print("a")
+print("b")`))
+	check("adjacent text coalesces",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 1 &&
+			res.Outputs[0].Type == "text" && res.Outputs[0].Text == "a\nb\n" &&
+			res.Output == "a\nb\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	flushInst := fresh()
+	res, err = flushInst.invokeJSON(ctx, startRequest(`import quickpy
+print("a")
+quickpy.console.info("b")
+print("c")`))
+	check("text flushes across console",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 3 &&
+			res.Outputs[0].Type == "text" && res.Outputs[0].Text == "a\n" &&
+			res.Outputs[1].Type == "console" && res.Outputs[1].Text == "b" &&
+			res.Outputs[2].Type == "text" && res.Outputs[2].Text == "c\n" &&
+			res.Output == "a\nc\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	binaryInst := fresh()
+	res, err = binaryInst.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.image(bytes([0, 255, 128, 10, 13, 34, 92, 0, 1, 2]), mime="image/png")`))
+	img, imgOK = findOutput(res.Outputs, "image")
+	imgData = nil
+	if imgOK {
+		imgData, _ = decodeBase64(img.DataBase64)
+	}
+	check("image binary exact roundtrip",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 1 && imgOK &&
+			bytesEqual(imgData, []byte{0, 255, 128, 10, 13, 34, 92, 0, 1, 2}),
+		fmt.Sprintf("err=%v %s data=%v", err, describe(res), imgData))
+
+	allBytesInst := fresh()
+	res, err = allBytesInst.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.image(bytes(range(256)))`))
+	img, imgOK = findOutput(res.Outputs, "image")
+	imgData = nil
+	if imgOK {
+		imgData, _ = decodeBase64(img.DataBase64)
+	}
+	wantAll := make([]byte, 256)
+	for i := range wantAll {
+		wantAll[i] = byte(i)
+	}
+	check("image all byte values",
+		err == nil && res.Type == "completed" && imgOK && bytesEqual(imgData, wantAll),
+		fmt.Sprintf("err=%v %s len=%d", err, describe(res), len(imgData)))
+
+	mutateInst := fresh()
+	res, err = mutateInst.invokeJSON(ctx, startRequest(`import quickpy
+b = bytearray([1, 2, 3])
+quickpy.image(b)
+b[0] = 9
+print("done")`))
+	img, imgOK = findOutput(res.Outputs, "image")
+	imgData = nil
+	if imgOK {
+		imgData, _ = decodeBase64(img.DataBase64)
+	}
+	check("image bytearray copied before mutation",
+		err == nil && res.Type == "completed" && imgOK &&
+			bytesEqual(imgData, []byte{1, 2, 3}) &&
+			res.Output == "done\n",
+		fmt.Sprintf("err=%v %s data=%v", err, describe(res), imgData))
+
+	mimeInst := fresh()
+	res, err = mimeInst.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.image(b"x")
+quickpy.image(b"y", mime="image/jpeg")`))
+	check("image mime default and custom",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 2 &&
+			res.Outputs[0].MIME == "image/png" &&
+			res.Outputs[1].MIME == "image/jpeg",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	invalidInst := fresh()
+	res, err = invalidInst.invokeJSON(ctx, startRequest(`import quickpy
+def expect(fn, exc, label):
+    try:
+        fn()
+    except exc:
+        print("ok", label)
+    else:
+        print("miss", label)
+expect(lambda: quickpy.image("str"), TypeError, "type")
+expect(lambda: quickpy.image(123), TypeError, "type")
+expect(lambda: quickpy.image(b"x", mime=""), ValueError, "value")
+expect(lambda: quickpy.image(b"x", mime="image png"), ValueError, "value")
+expect(lambda: quickpy.image(b"x", mime="image/png\n"), ValueError, "value")
+expect(lambda: quickpy.image(b"x", mime="imäge/png"), ValueError, "value")
+expect(lambda: quickpy.image(b"x", mime="png"), ValueError, "value")
+expect(lambda: quickpy.image(b"x", mime="image/png/extra"), ValueError, "value")`))
+	check("image validation rejects bad data and mime",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 1 &&
+			res.Outputs[0].Type == "text" &&
+			strings.Count(res.Outputs[0].Text, "ok ") == 8 &&
+			!strings.Contains(res.Outputs[0].Text, "miss"),
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	edgeInst := fresh()
+	res, err = edgeInst.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.image(b"")
+quickpy.image(b"x", mime="a/" + "b" * 126)
+try:
+    quickpy.image(b"x", mime="a/" + "b" * 127)
+except ValueError:
+    print("long-mime-rejected")`))
+	check("image empty and mime length boundary",
+		err == nil && res.Type == "completed" &&
+			len(res.Outputs) == 3 &&
+			res.Outputs[0].Type == "image" && res.Outputs[0].DataBase64 == "" &&
+			res.Outputs[1].Type == "image" && len(res.Outputs[1].MIME) == 128 &&
+			res.Outputs[2].Type == "text" && res.Outputs[2].Text == "long-mime-rejected\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	oversizeInst := fresh()
+	res, err = oversizeInst.invokeJSON(ctx, startRequest(`import quickpy
+try:
+    quickpy.image(bytes(1024 * 1024 + 1))
+except ValueError as e:
+    print("oversize", str(e))
+print("after")`))
+	check("image oversize rejected",
+		err == nil && res.Type == "completed" &&
+			strings.Contains(res.Output, "oversize image exceeds the guest size limit\n") &&
+			strings.Contains(res.Output, "after\n") &&
+			len(res.Outputs) == 1 && res.Outputs[0].Type == "text",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	totalCapInst := fresh()
+	res, err = totalCapInst.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.image(bytes(1024 * 1024))
+try:
+    quickpy.image(b"x")
+except ValueError as e:
+    print("total", str(e))`))
+	check("image total cap rejected",
+		err == nil && res.Type == "completed" &&
+			strings.Contains(res.Output, "total image output exceeds the guest total limit\n") &&
+			len(res.Outputs) == 2 &&
+			res.Outputs[0].Type == "image" && res.Outputs[1].Type == "text",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	sentinelInst := fresh()
+	res, err = sentinelInst.invokeJSON(ctx, startRequest(`print("__quickpy_console__:error:boom")
+print("{\"type\":\"image\"}")`))
+	check("print sentinel stays text",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 1 &&
+			res.Outputs[0].Type == "text" &&
+			res.Outputs[0].Text == "__quickpy_console__:error:boom\n{\"type\":\"image\"}\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	deltaInst := fresh()
+	res, err = deltaInst.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+
+async def main():
+    print("before")
+    quickpy.console.info("c1")
+    a = await quickpy.tools.a(value=1)
+    print("after-a", a)
+    quickpy.console.warn("c2")
+    b = await quickpy.tools.b(value=2)
+    quickpy.image(b"\x00\x01", mime="image/png")
+    print("after-b", b)
+
+quickpy.run(main())`))
+	check("async output delta first suspend",
+		err == nil && res.Type == "suspended" && len(res.Calls) == 1 &&
+			len(res.Outputs) == 2 &&
+			res.Outputs[0].Type == "text" && res.Outputs[0].Text == "before\n" &&
+			res.Outputs[1].Type == "console" && res.Outputs[1].Level == "info" && res.Outputs[1].Text == "c1" &&
+			res.Output == "before\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+	if len(res.Calls) == 1 {
+		idA := res.Calls[0].ID
+		res, err = deltaInst.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": idA, "ok": true, "value": "A"},
+		}, false))
+		check("async output delta second suspend",
+			err == nil && res.Type == "suspended" && len(res.Calls) == 1 &&
+				len(res.Outputs) == 2 &&
+				res.Outputs[0].Type == "text" && res.Outputs[0].Text == "after-a A\n" &&
+				res.Outputs[1].Type == "console" && res.Outputs[1].Level == "warn" && res.Outputs[1].Text == "c2" &&
+				res.Output == "after-a A\n" &&
+				!strings.Contains(res.Output, "before"),
+			fmt.Sprintf("err=%v %s", err, describe(res)))
+		if len(res.Calls) == 1 {
+			idB := res.Calls[0].ID
+			res, err = deltaInst.invokeJSON(ctx, toolResponses([]map[string]any{
+				{"id": idB, "ok": true, "value": "B"},
+			}, false))
+			img, imgOK = findOutput(res.Outputs, "image")
+			imgData = nil
+			if imgOK {
+				imgData, _ = decodeBase64(img.DataBase64)
+			}
+			check("async output delta completed",
+				err == nil && res.Type == "completed" &&
+					len(res.Outputs) == 2 &&
+					res.Outputs[0].Type == "image" && res.Outputs[0].MIME == "image/png" &&
+					res.Outputs[1].Type == "text" && res.Outputs[1].Text == "after-b B\n" &&
+					res.Output == "after-b B\n" &&
+					imgOK && bytesEqual(imgData, []byte{0x00, 0x01}) &&
+					!strings.Contains(res.Output, "before") &&
+					!strings.Contains(res.Output, "after-a"),
+				fmt.Sprintf("err=%v %s", err, describe(res)))
+		}
+	}
+
+	failedOut := fresh()
+	res, err = failedOut.invokeJSON(ctx, startRequest(`import quickpy
+print("before")
+quickpy.console.error("bad")
+raise ValueError("boom")`))
+	check("failed response outputs",
+		err == nil && res.Type == "failed" && res.Error != nil &&
+			len(res.Outputs) == 2 &&
+			res.Outputs[0].Type == "text" && res.Outputs[0].Text == "before\n" &&
+			res.Outputs[1].Type == "console" && res.Outputs[1].Level == "error" && res.Outputs[1].Text == "bad" &&
+			res.Output == "before\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	emptyOut := fresh()
+	res, err = emptyOut.invokeJSON(ctx, startRequest(`x = 1`))
+	check("empty outputs",
+		err == nil && res.Type == "completed" && len(res.Outputs) == 0 && res.Output == "",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	stateOut := fresh()
+	res, err = stateOut.invokeJSON(ctx, startRequest(`import quickpy
+quickpy.set_state({"n": 1})
+quickpy.console.info("state")
+quickpy.image(b"\x00", mime="image/png")
+quickpy.set_state({"n": 2})`))
+	stateVal, stateOK = decodeState(res)
+	check("console image state unaffected",
+		err == nil && res.Type == "completed" &&
+			res.StateWritten != nil && *res.StateWritten && stateOK &&
+			jsonEqual(stateVal, map[string]any{"n": float64(2)}) &&
+			len(res.Outputs) == 2 &&
+			res.Outputs[0].Type == "console" && res.Outputs[1].Type == "image",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	// Close the last scenario's module explicitly so the ownership check below
+	// sees a balanced count.  The defer in main is a safety net for early exits.
+	if currentInstance != nil {
+		currentInstance.Close(ctx)
+		currentInstance = nil
+	}
+	check("harness closes every instance",
+		instancesCreated == instancesClosed,
+		fmt.Sprintf("created=%d closed=%d", instancesCreated, instancesClosed))
+	fmt.Printf("harness instances: created=%d closed=%d\n", instancesCreated, instancesClosed)
 
 	if failures > 0 {
 		fmt.Printf("%d failure(s)\n", failures)

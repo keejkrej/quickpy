@@ -4,10 +4,11 @@ QuickPy is an experimental, embeddable Python execution runtime: a Go host
 drives a fresh WebAssembly instance of MicroPython per execution, with a narrow
 host-tool boundary, structured output, and explicit lifecycle and limits.
 
-This repository contains an **M0-accepted feasibility baseline** and an
-**in-progress M1 public SDK**. M1 is not accepted as a full release yet. It is
-not a stable public SDK, not CPython, and not integrated with pi-go. See
-[`docs/M1_STATUS.md`](docs/M1_STATUS.md) for the current M1 snapshot.
+This repository contains an **M0-accepted feasibility baseline** and a
+**full M1-accepted public SDK + persistence milestone**. M1 acceptance is a
+milestone verdict, not production GA, a stable 1.0 API, CPython compatibility,
+or pi-go integration. See [`docs/M1_STATUS.md`](docs/M1_STATUS.md) for the
+accepted M1 evidence and constraints.
 
 ## What this is
 
@@ -28,6 +29,9 @@ not a stable public SDK, not CPython, and not integrated with pi-go. See
   an optional later path.
 - Not OS process isolation. WASM is a guest memory/capability boundary, not a
   process sandbox.
+- Not the proposed compiled-agent target in
+  [`docs/AGENT_TARGET.md`](docs/AGENT_TARGET.md); that is a post-M1 north star,
+  not current scope.
 
 ## Architecture at a glance
 
@@ -50,9 +54,10 @@ MicroPython's non-local-return implementation uses one EH tag.
 |---|---|
 | `docs/SPEC.md` | Technical specification and milestone criteria. |
 | `docs/HANDOFF.md` | Start-here guide for a new agent on a new machine. |
-| `docs/M1_STATUS.md` | Current M1 increment, integration evidence, and open gates. |
+| `docs/M1_STATUS.md` | Accepted M1 evidence, limits, and constraints. |
+| `docs/AGENT_TARGET.md` | Proposed post-M1 compiled-agent north star; not current scope. |
 | `guest/M0_NOTES.md` | Historical M0 guest build notes, pins, ABI, and evidence. |
-| `guest/M1_NOTES.md` | M1 guest state slice, ABI 2, and artifact evidence. |
+| `guest/M1_NOTES.md` | M1 guest state/output slice, ABI 4, and artifact evidence. |
 | `api.go`, `runtime.go`, `execution.go`, `events.go`, `errors.go`, `value.go` | Public `quickpy` SDK package. |
 | `guest/build.sh` | Fetches the pinned MicroPython checkout and builds the artifact. |
 | `guest/port/` | C adapter, MicroPython port config, frozen Python modules. |
@@ -115,15 +120,28 @@ intentional committed fixtures, not the real guest.
 all 11 M0 exit criteria**. M0 is an accepted feasibility baseline, not a
 production SDK.
 
-**M1 is in progress and not accepted as a full release.** The public root
-package, persistence/state, events, lifecycle, and the real-artifact integration
-suite now form a coherent, integration-tested increment. The integration suite
-is worker-reported passing (40 top-level tests plus 14 subtests, ~7.9 s; race
-run ~40.3 s) and skips cleanly when `QUICKPY_TEST_ARTIFACT` is unset.
-Independent verification is being started; until its report lands, treat these
-as worker-reported results, not independent confirmation. See
-[`docs/M1_STATUS.md`](docs/M1_STATUS.md) for the exact current pieces, open
-gates, and deviations.
+**M1 is accepted (independent verification, 2026-11-18).** All **12 M1 exit
+criteria** in [`docs/SPEC.md`](docs/SPEC.md) §16 pass against the real artifact.
+The public root package, persistence/state, events, lifecycle, structured
+console/image output, tool conformance, and the real-artifact integration suite
+form the accepted milestone. This is **not** production GA, a stable 1.0 API,
+CPython compatibility, or pi-go integration.
+
+Verified for M1:
+
+- Artifact: **236,119 bytes**, sha256
+  `171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`,
+  ABI **4**, MicroPython **1.29.0**, protocol envelope **0**, **zero** WASI
+  imports, **1** EH tag, **64/1024** memory pages, **4 MiB** guest heap; a
+  clean-directory rebuild was byte-identical.
+- **118/118** guest smoke checks pass; **78/78** instances closed.
+- **72** top-level integration tests plus **74** subtests (~15.4 s; `-race`
+  110.2 s); **58** root tests; **126** internal tests total.
+- Opt-in soak: **1060** executions in **27.84 s**, zero errors, goroutines
+  **2/2**, RSS around **360 MiB** and stable on the reference machine. This is
+  a process-level observation, not a per-instance memory guarantee.
+- `gofmt`, `go vet`, `go build`, default tests, and default-race pass; repeat
+  async/lifecycle runs passed **3×**.
 
 The M0 evidence below is retained as history. Its artifact size, hash, and
 memory numbers are **stale** for the M1 artifact; use
@@ -153,9 +171,10 @@ Verified for M0 on the development machine:
   run. This is a process-level, approximate measurement; the spike CLI's own
   run reported ~13.1–13.6 MiB per instance.
 
-M0 is accepted. The current milestone is **M1**: the public Go SDK surface,
-persistence/state, events, and the conformance suites. Start with
-[`docs/M1_STATUS.md`](docs/M1_STATUS.md) and
+M0 and M1 are accepted. The next direction is post-M1 corpus packaging and the
+proposed compiled-agent target in
+[`docs/AGENT_TARGET.md`](docs/AGENT_TARGET.md); it is proposed, not current
+scope. Start with [`docs/M1_STATUS.md`](docs/M1_STATUS.md) and
 [`docs/HANDOFF.md`](docs/HANDOFF.md) §6.
 
 ## Public SDK (M1, pre-1.0)
@@ -231,19 +250,19 @@ per-execution `ExecuteRequest.EventSink`.
 `ExecuteRequest.MaxMemoryBytes` must be zero (inherit) or exactly equal to the
 runtime value; a tighter value is rejected rather than silently ignored.
 `MaxToolCalls == 0` means no cap. `DefaultTimeout == 0` means no default
-timeout. The host requires ABI 2 and rejects 0.1 artifacts.
+timeout. The host requires ABI 4 and rejects older artifacts.
 
-The public SDK + persistence increment is covered by the gated real-artifact
-suite in [`integration/`](integration/); see
+The accepted M1 public SDK + persistence increment is covered by the gated
+real-artifact suite in [`integration/`](integration/); see
 [`integration/README.md`](integration/README.md) for the exact commands and
-coverage. `ImageEvent` is an exported type, but the real guest has no image
-transport yet; it is documentation/API surface only for now.
+coverage. `ConsoleEvent` and `ImageEvent` are real ABI 4 output channels; the
+guest emits ordered text, console, and image events.
 
 ## Known hard requirements and limitations
 
-M0 acceptance is a feasibility verdict, not a production-readiness claim. M1 is
-not accepted as a full release yet; the current increment is integration-tested
-but still has open gates.
+M0 and M1 acceptance are milestone verdicts, not production-readiness claims.
+The following are accepted MicroPython/runtime constraints and post-M1 work, not
+open M1 conformance gates.
 
 - wazero must enable `experimental.CoreFeaturesExceptionHandling`; the artifact
   contains one required EH tag.
@@ -261,27 +280,26 @@ but still has open gates.
 - Frozen-module coverage is narrow (`math`, `uos`, and `gc` are not available
   in the current guest build).
 - `MaxMemoryBytes` is applied at the wazero runtime level, not per instance.
-  Per-execution memory tightening is rejected, not silently ignored.
+  Per-execution memory tightening is rejected, not silently ignored. A
+  configured cap hit during guest allocation is a guest-visible
+  `MemoryError`/`ScriptError`, not `LimitExceeded`; see
+  [`docs/adr/0001-guest-allocation-failures.md`](docs/adr/0001-guest-allocation-failures.md).
 - Positive timers are unsupported and fail loudly.
-- The guest protocol and Go API are not stable.
-- `GuestInfo.Version` is currently blank; `ConsoleEvent`/`ImageEvent` are
-  exposed but the real guest does not emit console or image output yet.
-- An uncaught structured `ToolCause` is not populated yet.
-- Event streaming occurs when a guest invocation returns, not during a
+- Output is observed when a guest invocation returns, not streamed during a
   long-running yield-free C/Python section.
-- The integration suite covers the main public SDK and persistence scenarios,
-  but not every request-specific cap with the real artifact: `MaxSourceBytes`,
-  `MaxToolCalls`, `MaxPendingCalls`, `MaxResumes`, and tool-result caps are only
-  partly covered by synthetic tests. Real protocol/guest-fault coverage is also
-  synthetic.
-- No host wall-clock timers and no top-level `await`/`return`.
-- No stable artifact distribution/embedding contract yet.
-- A complete normative `asyncio` subset/failure matrix and a dedicated
-  soak/resource-leak trend are still needed.
-- No pi-go integration.
+- No stable artifact distribution/embedding contract yet; that remains future
+  packaging work.
+- No pi-go integration and no Zig rewrite.
+- Not CPython or pip-compatible; it is a MicroPython subset.
+- Not production GA and not a stable 1.0 API; the guest protocol and Go API are
+  pre-1.0 and may change.
+- The proposed post-M1 compiled-agent direction is
+  [`docs/AGENT_TARGET.md`](docs/AGENT_TARGET.md). OS wrappers are future
+  `AgentScript` work and remain default-deny.
 - The current guest uses a 4 MiB heap and 4 MiB initial linear memory. M0
-  startup/RSS measurements must not be reused blindly for M1; new M1 memory
-  measurements are not yet recorded here.
+  startup/RSS measurements must not be reused blindly for M1; see
+  [`guest/M1_NOTES.md`](guest/M1_NOTES.md) and
+  [`integration/SOAK.md`](integration/SOAK.md) for current evidence.
 
 ## License status
 

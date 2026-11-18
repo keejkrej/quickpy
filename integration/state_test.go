@@ -15,13 +15,22 @@ func TestArtifactIdentity(t *testing.T) {
 	if size < 100_000 {
 		t.Fatalf("artifact size = %d, want a real MicroPython artifact (>= 100000 bytes)", size)
 	}
+	if len(sum) != 64 {
+		t.Fatalf("sha256 = %q, want 64 hex characters", sum)
+	}
 	r := newRuntime(t, quickpy.RuntimeOptions{})
 	res := mustWait(t, execute(t, r, quickpy.ExecuteRequest{Source: `print("ok")`}))
-	if res.Guest.ABIVersion != 2 {
-		t.Fatalf("ABI version = %d, want 2", res.Guest.ABIVersion)
+	if res.Guest.ABIVersion != 4 {
+		t.Fatalf("ABI version = %d, want 4", res.Guest.ABIVersion)
 	}
 	if res.Guest.Engine != "micropython" {
 		t.Fatalf("engine = %q, want micropython", res.Guest.Engine)
+	}
+	if res.Guest.Version != "1.29.0" {
+		t.Fatalf("guest version = %q, want 1.29.0", res.Guest.Version)
+	}
+	if res.Guest.ProtocolVersion != "0" {
+		t.Fatalf("protocol version = %q, want 0", res.Guest.ProtocolVersion)
 	}
 	if len(res.Guest.Imports) != 0 {
 		t.Fatalf("imports = %+v, want none", res.Guest.Imports)

@@ -11,11 +11,11 @@ const (
 	ObservationTool    ObservationKind = "tool"
 )
 
-// Observation is one ordered execution observation. Text and console
+// Observation is one ordered execution observation. Text, console, and image
 // observations carry guest output. Tool observations carry the call name, the
 // internal call ID, the phase ("started" or "finished"), and an error code
-// when the call failed. Image observations are reserved for a future guest
-// output channel; the current guest does not emit them.
+// when the call failed. Image observations carry a validated MIME type and raw
+// decoded bytes.
 type Observation struct {
 	Kind     ObservationKind
 	Text     string

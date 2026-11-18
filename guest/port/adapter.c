@@ -26,6 +26,7 @@
 #include "py/mperrno.h"
 #include "py/mphal.h"
 #include "py/obj.h"
+#include "py/objarray.h"
 #include "py/objexcept.h"
 #include "py/objint.h"
 #include "py/objlist.h"
@@ -131,14 +132,11 @@ static void sb_free(sb_t *b) {
     b->cap = 0;
 }
 
-// Append a JSON string literal, escaping as required by RFC 8259.  Invalid
-// UTF-8 is passed through byte-for-byte; the spike assumes the host sends
-// valid UTF-8.
-static int sb_json_str(sb_t *b, const char *s, size_t n) {
+// Append JSON-escaped string content (no surrounding quotes), escaping as
+// required by RFC 8259.  Invalid UTF-8 is passed through byte-for-byte; the
+// spike assumes text output is valid UTF-8.
+static int sb_json_escaped(sb_t *b, const char *s, size_t n) {
     static const char hex[] = "0123456789abcdef";
-    if (sb_putc(b, '"') != 0) {
-        return -1;
-    }
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
         switch (c) {
@@ -159,7 +157,306 @@ static int sb_json_str(sb_t *b, const char *s, size_t n) {
                 break;
         }
     }
+    return 0;
+}
+
+// Append a complete JSON string literal.
+static int sb_json_str(sb_t *b, const char *s, size_t n) {
+    if (sb_putc(b, '"') != 0) {
+        return -1;
+    }
+    if (sb_json_escaped(b, s, n) != 0) {
+        return -1;
+    }
     return sb_putc(b, '"');
+}
+
+// Append standard base64 (RFC 4648, with padding) for raw bytes.  The input is
+// never interpreted as text, so NUL and invalid UTF-8 survive exactly.
+static int sb_put_base64(sb_t *b, const unsigned char *data, size_t len) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0;
+    while (i + 3 <= len) {
+        uint32_t v = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8) | data[i + 2];
+        char out[4] = {
+            tbl[(v >> 18) & 0x3f], tbl[(v >> 12) & 0x3f],
+            tbl[(v >> 6) & 0x3f], tbl[v & 0x3f],
+        };
+        if (sb_putn(b, out, sizeof(out)) != 0) return -1;
+        i += 3;
+    }
+    if (len - i == 1) {
+        uint32_t v = (uint32_t)data[i] << 16;
+        char out[4] = {tbl[(v >> 18) & 0x3f], tbl[(v >> 12) & 0x3f], '=', '='};
+        if (sb_putn(b, out, sizeof(out)) != 0) return -1;
+    } else if (len - i == 2) {
+        uint32_t v = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8);
+        char out[4] = {tbl[(v >> 18) & 0x3f], tbl[(v >> 12) & 0x3f], tbl[(v >> 6) & 0x3f], '='};
+        if (sb_putn(b, out, sizeof(out)) != 0) return -1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Ordered output events.
+//
+// Every guest output is recorded as one event in emission order.  Text from
+// print()/stdout coalesces with an adjacent text event; a console or image
+// event always starts a new record, so text is implicitly flushed before the
+// next kind.  The legacy "output" string is rebuilt from text events only.
+//
+// Caps are guest-side safety limits.  The host must still enforce its exact
+// MaxOutputBytes/MaxMessageBytes; see guest/M1_NOTES.md.
+// ---------------------------------------------------------------------------
+
+#define QP_MAX_TEXT_BYTES (1024 * 1024)
+#define QP_MAX_IMAGE_BYTES (1024 * 1024)
+#define QP_MAX_IMAGE_TOTAL_BYTES (1024 * 1024)
+#define QP_MAX_OUTPUT_EVENTS 1024
+
+enum {
+    EV_TEXT = 0,
+    EV_CONSOLE = 1,
+    EV_IMAGE = 2,
+};
+
+typedef struct {
+    uint8_t kind;
+    uint8_t level;   // console level index
+    char *text;      // text/console text, or image MIME
+    size_t text_len;
+    char *data;      // image raw bytes
+    size_t data_len;
+} out_event_t;
+
+static out_event_t *g_events;
+static size_t g_events_len;
+static size_t g_events_cap;
+static size_t g_text_bytes;
+static size_t g_image_bytes;
+static bool g_out_truncated;
+static bool g_out_oom;
+
+static int grow_events(size_t need) {
+    if (need <= g_events_cap) {
+        return 0;
+    }
+    size_t cap = g_events_cap ? g_events_cap * 2 : 8;
+    while (cap < need) {
+        cap *= 2;
+    }
+    out_event_t *p = (out_event_t *)realloc(g_events, cap * sizeof(out_event_t));
+    if (p == NULL) {
+        return -1;
+    }
+    g_events = p;
+    g_events_cap = cap;
+    return 0;
+}
+
+static void reset_outputs(void) {
+    for (size_t i = 0; i < g_events_len; i++) {
+        free(g_events[i].text);
+        free(g_events[i].data);
+    }
+    g_events_len = 0;
+    g_text_bytes = 0;
+    g_image_bytes = 0;
+    g_out_truncated = false;
+    g_out_oom = false;
+}
+
+// Clamp a text chunk to the remaining text budget without cutting a UTF-8
+// sequence in half.  Returns the accepted length and sets *truncated.
+static size_t clamp_text(const char *s, size_t n, bool *truncated) {
+    if (g_text_bytes >= QP_MAX_TEXT_BYTES) {
+        *truncated = true;
+        return 0;
+    }
+    size_t room = QP_MAX_TEXT_BYTES - g_text_bytes;
+    if (n > room) {
+        n = room;
+        while (n > 0 && ((unsigned char)s[n] & 0xc0) == 0x80) {
+            n--;
+        }
+        *truncated = true;
+    }
+    return n;
+}
+
+static int append_text(const char *s, size_t n) {
+    if (n == 0) {
+        return 0;
+    }
+    bool truncated = false;
+    n = clamp_text(s, n, &truncated);
+    if (truncated) {
+        g_out_truncated = true;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    if (g_events_len > 0 && g_events[g_events_len - 1].kind == EV_TEXT) {
+        out_event_t *e = &g_events[g_events_len - 1];
+        char *p = (char *)realloc(e->text, e->text_len + n + 1);
+        if (p == NULL) {
+            g_out_oom = true;
+            return -1;
+        }
+        memcpy(p + e->text_len, s, n);
+        e->text = p;
+        e->text_len += n;
+        p[e->text_len] = '\0';
+    } else {
+        if (g_events_len >= QP_MAX_OUTPUT_EVENTS) {
+            g_out_truncated = true;
+            return 0;
+        }
+        if (grow_events(g_events_len + 1) != 0) {
+            g_out_oom = true;
+            return -1;
+        }
+        out_event_t *e = &g_events[g_events_len];
+        memset(e, 0, sizeof(*e));
+        e->kind = EV_TEXT;
+        e->text = (char *)malloc(n + 1);
+        if (e->text == NULL) {
+            g_out_oom = true;
+            return -1;
+        }
+        memcpy(e->text, s, n);
+        e->text[n] = '\0';
+        e->text_len = n;
+        g_events_len++;
+    }
+    g_text_bytes += n;
+    return 0;
+}
+
+static int append_console(int level, const char *s, size_t n) {
+    if (g_events_len >= QP_MAX_OUTPUT_EVENTS) {
+        g_out_truncated = true;
+        return 0;
+    }
+    bool truncated = false;
+    n = clamp_text(s, n, &truncated);
+    if (truncated) {
+        g_out_truncated = true;
+    }
+    if (grow_events(g_events_len + 1) != 0) {
+        g_out_oom = true;
+        return -1;
+    }
+    out_event_t *e = &g_events[g_events_len];
+    memset(e, 0, sizeof(*e));
+    e->kind = EV_CONSOLE;
+    e->level = (uint8_t)level;
+    e->text = (char *)malloc(n + 1);
+    if (e->text == NULL) {
+        g_out_oom = true;
+        return -1;
+    }
+    if (n != 0) {
+        memcpy(e->text, s, n);
+    }
+    e->text[n] = '\0';
+    e->text_len = n;
+    g_events_len++;
+    g_text_bytes += n;
+    return 0;
+}
+
+// Returns 0 on success, -1 when the event cap is reached, -2 on allocation
+// failure.  Size caps are validated by the caller before this is reached.
+static int append_image(const char *mime, size_t mime_len, const char *data, size_t data_len) {
+    if (g_events_len >= QP_MAX_OUTPUT_EVENTS) {
+        return -1;
+    }
+    if (grow_events(g_events_len + 1) != 0) {
+        g_out_oom = true;
+        return -2;
+    }
+    out_event_t *e = &g_events[g_events_len];
+    memset(e, 0, sizeof(*e));
+    e->kind = EV_IMAGE;
+    e->text = (char *)malloc(mime_len + 1);
+    e->data = (char *)malloc(data_len ? data_len : 1);
+    if (e->text == NULL || e->data == NULL) {
+        free(e->text);
+        free(e->data);
+        e->text = NULL;
+        e->data = NULL;
+        g_out_oom = true;
+        return -2;
+    }
+    memcpy(e->text, mime, mime_len);
+    e->text[mime_len] = '\0';
+    e->text_len = mime_len;
+    if (data_len != 0) {
+        memcpy(e->data, data, data_len);
+    }
+    e->data_len = data_len;
+    g_events_len++;
+    g_image_bytes += data_len;
+    return 0;
+}
+
+static const char *console_level_name(uint8_t level) {
+    switch (level) {
+        case 0: return "debug";
+        case 1: return "info";
+        case 2: return "warn";
+        case 3: return "error";
+        default: return "info";
+    }
+}
+
+static int parse_console_level(const char *s, size_t n) {
+    if (n == 5 && memcmp(s, "debug", 5) == 0) return 0;
+    if (n == 4 && memcmp(s, "info", 4) == 0) return 1;
+    if (n == 4 && memcmp(s, "warn", 4) == 0) return 2;
+    if (n == 5 && memcmp(s, "error", 5) == 0) return 3;
+    return -1;
+}
+
+// RFC 7230 token character.
+static bool is_token_char(unsigned char c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+        return true;
+    }
+    switch (c) {
+        case '!': case '#': case '$': case '%': case '&': case '\'':
+        case '*': case '+': case '-': case '.': case '^': case '_':
+        case '`': case '|': case '~':
+            return true;
+        default:
+            return false;
+    }
+}
+
+// A MIME type is exactly "token/token": non-empty, printable, no whitespace or
+// control characters, and no parameters.  This keeps the value safe to embed
+// in JSON and small enough to bound.
+static bool valid_mime(const char *s, size_t n) {
+    if (n == 0 || n > 128) {
+        return false;
+    }
+    size_t slashes = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '/') {
+            slashes++;
+            continue;
+        }
+        if (!is_token_char(c)) {
+            return false;
+        }
+    }
+    if (slashes != 1) {
+        return false;
+    }
+    return s[0] != '/' && s[n - 1] != '/';
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +481,9 @@ typedef struct {
     char *initial_state;
     size_t initial_state_len;
     bool has_initial_state;
+    int64_t max_tool_calls;
+    bool has_max_tool_calls;
+    bool bad_max_tool_calls;
     bool gc;
 } request_t;
 
@@ -311,7 +611,13 @@ static int jp_int(jp_t *j, int64_t *out) {
     }
     int64_t v = 0;
     while (j->p < j->end && *j->p >= '0' && *j->p <= '9') {
-        v = v * 10 + (*j->p - '0');
+        int d = *j->p - '0';
+        // Reject values that would overflow int64 rather than invoking
+        // undefined signed overflow on hostile input.
+        if (v > (INT64_MAX - d) / 10) {
+            return -1;
+        }
+        v = v * 10 + d;
         j->p++;
     }
     *out = neg ? -v : v;
@@ -481,6 +787,29 @@ static int parse_request(const char *buf, size_t len, request_t *r) {
             rc = jp_value_raw(&j, &r->initial_state, &r->initial_state_len);
             if (rc == 0) {
                 r->has_initial_state = true;
+            }
+        } else if (key_len == 14 && memcmp(key, "max_tool_calls", 14) == 0) {
+            // Consume the whole value first, then require it to be a bare
+            // integer.  This keeps a malformed value from aborting the whole
+            // request parse with a generic error.
+            jp_ws(&j);
+            const char *vstart = j.p;
+            if (jp_skip_value(&j) != 0) {
+                rc = -1;
+            } else {
+                jp_t sub = {vstart, j.p};
+                int64_t v = 0;
+                if (jp_int(&sub, &v) == 0) {
+                    jp_ws(&sub);
+                    if (sub.p == sub.end) {
+                        r->max_tool_calls = v;
+                        r->has_max_tool_calls = true;
+                    } else {
+                        r->bad_max_tool_calls = true;
+                    }
+                } else {
+                    r->bad_max_tool_calls = true;
+                }
             }
         } else if (key_len == 2 && memcmp(key, "gc", 2) == 0) {
             if (j.end - j.p >= 4 && memcmp(j.p, "true", 4) == 0) {
@@ -704,10 +1033,62 @@ static mp_obj_t mod_quickpy_has_pending_calls(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(mod_quickpy_has_pending_calls_obj, mod_quickpy_has_pending_calls);
 
+// Structured console output.  The Python wrapper joins arguments and passes an
+// exact level string; C validates both defensively so a direct _quickpy call
+// cannot inject an unknown level or a non-string payload.
+static mp_obj_t mod_quickpy_emit_console(mp_obj_t level_in, mp_obj_t text_in) {
+    size_t level_len = 0;
+    const char *level = mp_obj_str_get_data(level_in, &level_len);
+    int lvl = parse_console_level(level, level_len);
+    if (lvl < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid console level"));
+    }
+    size_t text_len = 0;
+    const char *text = mp_obj_str_get_data(text_in, &text_len);
+    if (append_console(lvl, text, text_len) != 0) {
+        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("console output failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickpy_emit_console_obj, mod_quickpy_emit_console);
+
+// Structured image output.  Data must be bytes/bytearray and is copied
+// immediately, so later mutation of a bytearray cannot corrupt the event.
+static mp_obj_t mod_quickpy_emit_image(mp_obj_t mime_in, mp_obj_t data_in) {
+    size_t mime_len = 0;
+    const char *mime = mp_obj_str_get_data(mime_in, &mime_len);
+    if (!valid_mime(mime, mime_len)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid image mime type"));
+    }
+    if (!mp_obj_is_type(data_in, &mp_type_bytes) &&
+        !mp_obj_is_type(data_in, &mp_type_bytearray)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("image data must be bytes or bytearray"));
+    }
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(data_in, &bufinfo, MP_BUFFER_READ);
+    if (bufinfo.len > QP_MAX_IMAGE_BYTES) {
+        mp_raise_ValueError(MP_ERROR_TEXT("image exceeds the guest size limit"));
+    }
+    if (g_image_bytes + bufinfo.len > QP_MAX_IMAGE_TOTAL_BYTES) {
+        mp_raise_ValueError(MP_ERROR_TEXT("image output exceeds the guest total limit"));
+    }
+    int rc = append_image(mime, mime_len, (const char *)bufinfo.buf, bufinfo.len);
+    if (rc == -1) {
+        mp_raise_ValueError(MP_ERROR_TEXT("image output exceeds the guest event limit"));
+    }
+    if (rc == -2) {
+        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("image output failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickpy_emit_image_obj, mod_quickpy_emit_image);
+
 static const mp_rom_map_elem_t quickpy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR__quickpy) },
     { MP_ROM_QSTR(MP_QSTR_register_call), MP_ROM_PTR(&mod_quickpy_register_call_obj) },
     { MP_ROM_QSTR(MP_QSTR_has_pending_calls), MP_ROM_PTR(&mod_quickpy_has_pending_calls_obj) },
+    { MP_ROM_QSTR(MP_QSTR_emit_console), MP_ROM_PTR(&mod_quickpy_emit_console_obj) },
+    { MP_ROM_QSTR(MP_QSTR_emit_image), MP_ROM_PTR(&mod_quickpy_emit_image_obj) },
 };
 static MP_DEFINE_CONST_DICT(quickpy_module_globals, quickpy_module_globals_table);
 
@@ -726,10 +1107,19 @@ static bool g_initialized;
 static bool g_started;
 static char *g_heap;
 static char *g_stack_top;
-static sb_t g_out;
 static sb_t g_exc_type;
 static sb_t g_exc_msg;
 static sb_t g_exc_tb;
+
+// Structured tool cause for an uncaught ToolError.  Populated from the
+// exception's own attributes, never by parsing the traceback text.
+static sb_t g_tool_cause_code;
+static sb_t g_tool_cause_msg;
+static sb_t g_tool_cause_tool;
+static bool g_has_tool_cause;
+static bool g_has_tool_cause_tool;
+static int64_t g_tool_cause_call_id;
+static bool g_has_tool_cause_call_id;
 
 static void capture_strn(void *data, const char *str, size_t len) {
     sb_putn((sb_t *)data, str, len);
@@ -738,7 +1128,10 @@ static void capture_strn(void *data, const char *str, size_t len) {
 static const mp_print_t g_err_print = {&g_exc_tb, capture_strn};
 
 mp_uint_t mp_hal_stdout_tx_strn(const char *str, size_t len) {
-    sb_putn(&g_out, str, len);
+    // Plain stdout is always a text event.  It is never parsed for control
+    // sentinels, so a print() that looks like a console/image message stays
+    // text.
+    append_text(str, len);
     return len;
 }
 
@@ -821,7 +1214,7 @@ static int ensure_init(void) {
             return -1;
         }
         // Guest-side safety caps.  The host must still enforce its own limits.
-        g_out.limit = 1024 * 1024;
+        // Output caps are compile-time constants in the output-event section.
         g_exc_msg.limit = 4096;
         g_exc_tb.limit = 16 * 1024;
         gc_init(g_heap, g_heap + MICROPY_HEAP_SIZE);
@@ -844,6 +1237,62 @@ static int ensure_init(void) {
 // Evaluation.
 // ---------------------------------------------------------------------------
 
+static void reset_tool_cause(void) {
+    sb_reset(&g_tool_cause_code);
+    sb_reset(&g_tool_cause_msg);
+    sb_reset(&g_tool_cause_tool);
+    g_has_tool_cause = false;
+    g_has_tool_cause_tool = false;
+    g_tool_cause_call_id = 0;
+    g_has_tool_cause_call_id = false;
+}
+
+// If exc is a quickpy.ToolError (or subclass), copy its structured attributes
+// into the tool-cause buffers.  Attribute access is guarded by nlr so a
+// hostile exception object cannot abort the adapter.
+static void capture_tool_cause(mp_obj_t exc) {
+    if (MP_STATE_VM(quickpy_module) == MP_OBJ_NULL) {
+        return;
+    }
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) != 0) {
+        // Attribute lookup raised; leave the cause unset.
+        return;
+    }
+    mp_obj_t cls = mp_load_attr(MP_STATE_VM(quickpy_module), MP_QSTR_ToolError);
+    if (!mp_obj_is_subclass_fast(MP_OBJ_FROM_PTR(mp_obj_get_type(exc)), cls)) {
+        nlr_pop();
+        return;
+    }
+
+    mp_obj_t code = mp_load_attr(exc, MP_QSTR_code);
+    size_t code_len = 0;
+    const char *code_str = mp_obj_str_get_data(code, &code_len);
+    sb_putn(&g_tool_cause_code, code_str, code_len);
+
+    mp_obj_t message = mp_load_attr(exc, MP_QSTR_message);
+    size_t msg_len = 0;
+    const char *msg_str = mp_obj_str_get_data(message, &msg_len);
+    sb_putn(&g_tool_cause_msg, msg_str, msg_len);
+
+    mp_obj_t tool = mp_load_attr(exc, MP_QSTR_tool);
+    if (tool != mp_const_none) {
+        size_t tool_len = 0;
+        const char *tool_str = mp_obj_str_get_data(tool, &tool_len);
+        sb_putn(&g_tool_cause_tool, tool_str, tool_len);
+        g_has_tool_cause_tool = true;
+    }
+
+    mp_obj_t call_id = mp_load_attr(exc, MP_QSTR_call_id);
+    if (call_id != mp_const_none) {
+        g_tool_cause_call_id = mp_obj_get_int(call_id);
+        g_has_tool_cause_call_id = true;
+    }
+
+    g_has_tool_cause = true;
+    nlr_pop();
+}
+
 static void capture_exception(mp_obj_t exc) {
     const char *type_name = "BaseException";
     if (mp_obj_is_exception_instance(exc)) {
@@ -857,6 +1306,7 @@ static void capture_exception(mp_obj_t exc) {
             mp_print_t msg_print = {&g_exc_msg, capture_strn};
             mp_obj_print_helper(&msg_print, value, PRINT_STR);
         }
+        capture_tool_cause(exc);
     }
 
     mp_obj_print_exception(&g_err_print, exc);
@@ -889,6 +1339,7 @@ static void set_protocol_error(const char *msg) {
     sb_reset(&g_exc_type);
     sb_reset(&g_exc_msg);
     sb_reset(&g_exc_tb);
+    reset_tool_cause();
     sb_puts(&g_exc_type, "ProtocolError");
     sb_puts(&g_exc_msg, msg);
 }
@@ -947,6 +1398,19 @@ static int call_python_set_initial_state(const char *json, size_t len) {
         mp_obj_t fun = mp_load_attr(MP_STATE_VM(quickpy_module), MP_QSTR__set_initial_state);
         mp_obj_t arg = json ? mp_obj_new_str(json, len) : mp_const_none;
         mp_call_function_1(fun, arg);
+        nlr_pop();
+        return 0;
+    }
+    capture_exception((mp_obj_t)nlr.ret_val);
+    return 1;
+}
+
+// Returns 0 on success, 1 on Python exception (captured).
+static int call_python_set_max_tool_calls(int64_t value) {
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t fun = mp_load_attr(MP_STATE_VM(quickpy_module), MP_QSTR__set_max_tool_calls);
+        mp_call_function_1(fun, mp_obj_new_int_from_ll((long long)value));
         nlr_pop();
         return 0;
     }
@@ -1107,13 +1571,70 @@ static int deliver_responses(const char *json, size_t len) {
     return j.p == j.end ? 0 : -1;
 }
 
+// Append the engine identity fields.  The version comes from the pinned
+// MicroPython checkout's MICROPY_VERSION_STRING macro, not a hardcoded date.
+static int sb_put_engine(sb_t *b) {
+    if (sb_puts(b, ",\"engine_name\":\"micropython\",\"engine_version\":\"") != 0) return -1;
+    if (sb_puts(b, MICROPY_VERSION_STRING) != 0) return -1;
+    return sb_putc(b, '"');
+}
+
+// Legacy "output" is the concatenation of TEXT events only.  Console and image
+// events are never folded into it; the host must prefer "outputs" when present
+// and must not concatenate the legacy string again.
+static int build_legacy_output(sb_t *b) {
+    if (sb_putc(b, '"') != 0) return -1;
+    for (size_t i = 0; i < g_events_len; i++) {
+        if (g_events[i].kind == EV_TEXT) {
+            if (sb_json_escaped(b, g_events[i].text ? g_events[i].text : "",
+                    g_events[i].text_len) != 0) {
+                return -1;
+            }
+        }
+    }
+    return sb_putc(b, '"');
+}
+
+static int build_outputs_json(sb_t *b) {
+    if (sb_putc(b, '[') != 0) return -1;
+    for (size_t i = 0; i < g_events_len; i++) {
+        out_event_t *e = &g_events[i];
+        if (i > 0 && sb_putc(b, ',') != 0) return -1;
+        if (e->kind == EV_TEXT) {
+            if (sb_puts(b, "{\"type\":\"text\",\"text\":") != 0) return -1;
+            if (sb_json_str(b, e->text ? e->text : "", e->text_len) != 0) return -1;
+            if (sb_putc(b, '}') != 0) return -1;
+        } else if (e->kind == EV_CONSOLE) {
+            if (sb_puts(b, "{\"type\":\"console\",\"level\":\"") != 0) return -1;
+            if (sb_puts(b, console_level_name(e->level)) != 0) return -1;
+            if (sb_puts(b, "\",\"text\":") != 0) return -1;
+            if (sb_json_str(b, e->text ? e->text : "", e->text_len) != 0) return -1;
+            if (sb_putc(b, '}') != 0) return -1;
+        } else {
+            if (sb_puts(b, "{\"type\":\"image\",\"mime\":") != 0) return -1;
+            if (sb_json_str(b, e->text ? e->text : "", e->text_len) != 0) return -1;
+            if (sb_puts(b, ",\"data_base64\":\"") != 0) return -1;
+            if (sb_put_base64(b, (const unsigned char *)(e->data ? e->data : ""),
+                    e->data_len) != 0) {
+                return -1;
+            }
+            if (sb_putc(b, '"') != 0) return -1;
+            if (sb_putc(b, '}') != 0) return -1;
+        }
+    }
+    return sb_putc(b, ']');
+}
+
 static int build_response(sb_t *resp, int failed, bool state_written,
     const char *state_json, size_t state_json_len) {
     if (sb_puts(resp, "{\"v\":0,\"type\":") != 0) return -1;
     if (sb_puts(resp, failed ? "\"failed\"" : "\"completed\"") != 0) return -1;
+    if (sb_put_engine(resp) != 0) return -1;
     if (sb_puts(resp, ",\"output\":") != 0) return -1;
-    if (sb_json_str(resp, g_out.p ? g_out.p : "", g_out.len) != 0) return -1;
-    if (g_out.truncated || g_out.oom) {
+    if (build_legacy_output(resp) != 0) return -1;
+    if (sb_puts(resp, ",\"outputs\":") != 0) return -1;
+    if (build_outputs_json(resp) != 0) return -1;
+    if (g_out_truncated || g_out_oom) {
         if (sb_puts(resp, ",\"output_truncated\":true") != 0) return -1;
     }
     if (failed) {
@@ -1125,6 +1646,21 @@ static int build_response(sb_t *resp, int failed, bool state_written,
         if (sb_json_str(resp, g_exc_tb.p ? g_exc_tb.p : "", g_exc_tb.len) != 0) return -1;
         if (g_exc_tb.truncated || g_exc_tb.oom) {
             if (sb_puts(resp, ",\"traceback_truncated\":true") != 0) return -1;
+        }
+        if (g_has_tool_cause) {
+            if (sb_puts(resp, ",\"tool_cause\":{\"code\":") != 0) return -1;
+            if (sb_json_str(resp, g_tool_cause_code.p ? g_tool_cause_code.p : "", g_tool_cause_code.len) != 0) return -1;
+            if (sb_puts(resp, ",\"message\":") != 0) return -1;
+            if (sb_json_str(resp, g_tool_cause_msg.p ? g_tool_cause_msg.p : "", g_tool_cause_msg.len) != 0) return -1;
+            if (g_has_tool_cause_tool) {
+                if (sb_puts(resp, ",\"tool\":") != 0) return -1;
+                if (sb_json_str(resp, g_tool_cause_tool.p ? g_tool_cause_tool.p : "", g_tool_cause_tool.len) != 0) return -1;
+            }
+            if (g_has_tool_cause_call_id) {
+                if (sb_puts(resp, ",\"call_id\":") != 0) return -1;
+                if (sb_put_int(resp, g_tool_cause_call_id) != 0) return -1;
+            }
+            if (sb_putc(resp, '}') != 0) return -1;
         }
         if (sb_puts(resp, "}") != 0) return -1;
     } else {
@@ -1147,6 +1683,7 @@ static int build_suspended_response(sb_t *resp, int stalled) {
     // undelivered calls, no timers.  "runnable" is reserved for a future
     // non-terminal early return and is not emitted by this build.
     if (sb_puts(resp, stalled ? "\"stalled\"" : "\"awaiting_calls\"") != 0) return -1;
+    if (sb_put_engine(resp) != 0) return -1;
     if (stalled) {
         if (sb_puts(resp, ",\"stalled\":true") != 0) return -1;
     }
@@ -1155,8 +1692,10 @@ static int build_suspended_response(sb_t *resp, int stalled) {
     if (sb_puts(resp, ",\"awaiting\":") != 0) return -1;
     if (build_awaiting_json(resp) != 0) return -1;
     if (sb_puts(resp, ",\"output\":") != 0) return -1;
-    if (sb_json_str(resp, g_out.p ? g_out.p : "", g_out.len) != 0) return -1;
-    if (g_out.truncated || g_out.oom) {
+    if (build_legacy_output(resp) != 0) return -1;
+    if (sb_puts(resp, ",\"outputs\":") != 0) return -1;
+    if (build_outputs_json(resp) != 0) return -1;
+    if (g_out_truncated || g_out_oom) {
         if (sb_puts(resp, ",\"output_truncated\":true") != 0) return -1;
     }
     return sb_puts(resp, "}");
@@ -1168,9 +1707,13 @@ static int build_suspended_response(sb_t *resp, int stalled) {
 
 __attribute__((export_name("qp_abi_version")))
 int32_t qp_abi_version(void) {
-    // Packed major/minor 0.2.  M1 state is additive but old 0.1 hosts would
-    // silently ignore initial_state, so the host must require 2.
-    return 2;
+    // Packed major/minor 0.4.  ABI4 adds the ordered structured "outputs"
+    // array (text/console/image) and the dedicated quickpy.console /
+    // quickpy.image guest APIs.  The envelope stays v:0 and every ABI3 field
+    // (max_tool_calls, tool causes, engine identity, state) is unchanged.  An
+    // ABI3 host would ignore "outputs" and lose console/image output, so the
+    // host must require 4 and reject older versions.
+    return 4;
 }
 
 __attribute__((export_name("qp_alloc")))
@@ -1198,11 +1741,13 @@ int64_t qp_invoke(int32_t ptr, int32_t len) {
     }
 
     // Reset per-invocation capture and the NEW-request delta.  g_calls (all
-    // undelivered calls) intentionally persists across invokes.
-    sb_reset(&g_out);
+    // undelivered calls) intentionally persists across invokes.  Output events
+    // are a per-response delta: a later resume never replays earlier output.
+    reset_outputs();
     sb_reset(&g_exc_type);
     sb_reset(&g_exc_msg);
     sb_reset(&g_exc_tb);
+    reset_tool_cause();
     reset_new_calls();
 
     if (ensure_init() != 0) {
@@ -1218,7 +1763,9 @@ int64_t qp_invoke(int32_t ptr, int32_t len) {
     request_t req;
     if (parse_request((const char *)(uintptr_t)(uint32_t)ptr, (size_t)len, &req) != 0) {
         sb_t resp = {0};
-        if (sb_puts(&resp, "{\"v\":0,\"type\":\"failed\",\"output\":\"\",\"error\":{\"type\":\"ProtocolError\",\"message\":\"invalid request JSON\"}}") != 0) {
+        if (sb_puts(&resp, "{\"v\":0,\"type\":\"failed\",\"engine_name\":\"micropython\",\"engine_version\":\"") != 0 ||
+            sb_puts(&resp, MICROPY_VERSION_STRING) != 0 ||
+            sb_puts(&resp, "\",\"output\":\"\",\"outputs\":[],\"error\":{\"type\":\"ProtocolError\",\"message\":\"invalid request JSON\"}}") != 0) {
             sb_free(&resp);
             return -1;
         }
@@ -1243,11 +1790,25 @@ int64_t qp_invoke(int32_t ptr, int32_t len) {
             if (g_started) {
                 set_protocol_error("start already executed");
                 failed = 1;
+            } else if (req.bad_max_tool_calls) {
+                set_protocol_error("max_tool_calls must be an integer");
+                failed = 1;
+            } else if (!req.has_max_tool_calls) {
+                // ABI3 requires the cap on every start.  Silently defaulting
+                // would run without the host's configured limit.
+                set_protocol_error("start is missing max_tool_calls");
+                failed = 1;
+            } else if (req.max_tool_calls < -1) {
+                set_protocol_error("max_tool_calls must be -1 (unlimited) or >= 0");
+                failed = 1;
             } else {
+                if (call_python_set_max_tool_calls(req.max_tool_calls) != 0) {
+                    failed = 1;
+                }
                 // initial_state is optional.  Absent and explicit null both
                 // mean Python None; the value is validated and copied by the
                 // guest before any source runs.
-                if (req.has_initial_state) {
+                if (!failed && req.has_initial_state) {
                     if (call_python_set_initial_state(req.initial_state, req.initial_state_len) != 0) {
                         failed = 1;
                     }
