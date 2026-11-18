@@ -53,6 +53,34 @@
 #define MICROPY_PY_TIME_GMTIME_LOCALTIME_MKTIME (0)
 #define MICROPY_PY_TIME_TIME_TIME_NS (0)
 
+// Safe language modules for agent scripting.  These are pure computation and
+// in-memory data handling: none of them add WASI imports or ambient
+// capabilities (no filesystem, network, environment, process, or clock).
+//
+// re: built-in C engine (lib/re1.5), no external library.  sub() accepts a
+// callable replacement; groups()/span()/start()/end() are enabled because the
+// default ROM level would otherwise omit them.
+#define MICROPY_PY_RE (1)
+#define MICROPY_PY_RE_SUB (1)
+#define MICROPY_PY_RE_MATCH_GROUPS (1)
+#define MICROPY_PY_RE_MATCH_SPAN_START_END (1)
+// math: double-precision libm from wasi-libc.  pi/e are always present; the
+// extra constants (tau/inf/nan) and special functions stay off.
+#define MICROPY_PY_MATH (1)
+// binascii: base64 and hex helpers for upcoming filesystem wrappers.  CRC32
+// needs uzlib and is not part of this baseline.
+#define MICROPY_PY_BINASCII (1)
+#define MICROPY_PY_BINASCII_CRC32 (0)
+// bytes.hex()/bytes.fromhex() back binascii.hexlify()/unhexlify().
+#define MICROPY_PY_BUILTINS_BYTES_HEX (1)
+// Unicode-aware str: len/index/slice count code points and \uXXXX escapes
+// (including json.loads) produce valid UTF-8.  Without this the minimum ROM
+// level stores \u escapes as single invalid bytes.
+#define MICROPY_PY_BUILTINS_STR_UNICODE (1)
+// io.StringIO for in-memory text.  open() is still overridden to raise OSError
+// in adapter.c, so this does not add filesystem access.
+#define MICROPY_PY_IO_IOBASE (1)
+
 // M1 state and tool values are IEEE float64 on the wire.  Use double
 // precision so values that single precision cannot distinguish survive the
 // guest round trip.

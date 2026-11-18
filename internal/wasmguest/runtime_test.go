@@ -3,6 +3,7 @@ package wasmguest
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -391,4 +392,141 @@ func TestExecuteAfterClose(t *testing.T) {
 	if !ok || we.Kind != KindRuntimeClosed {
 		t.Fatalf("error = %v", err)
 	}
+}
+
+func TestNewRuntimeFromBytes(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "completed.wasm"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	rt, err := NewRuntime(context.Background(), Options{
+		ArtifactBytes:   data,
+		MaxMemoryBytes:  16 << 20,
+		MaxMessageBytes: 1 << 20,
+		MaxOutputBytes:  1 << 20,
+		DefaultTimeout:  2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime from bytes: %v", err)
+	}
+	defer rt.Close(context.Background())
+
+	res, err := rt.Execute(context.Background(), Request{Source: `print("a")`, Filename: "main.py"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.Status != StatusCompleted {
+		t.Fatalf("status = %q", res.Status)
+	}
+	if res.Guest.ABIVersion != 4 || res.Guest.Engine != "micropython" || res.Guest.Version != "1.29.0" {
+		t.Fatalf("guest identity = %+v", res.Guest)
+	}
+	if len(res.Outputs) != 1 || res.Outputs[0].Text != "hello from synthetic guest" {
+		t.Fatalf("outputs = %+v", res.Outputs)
+	}
+}
+
+func TestNewRuntimeFromBytesDoesNotRetainSlice(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "completed.wasm"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	rt, err := NewRuntime(context.Background(), Options{
+		ArtifactBytes:   data,
+		MaxMemoryBytes:  16 << 20,
+		MaxMessageBytes: 1 << 20,
+		MaxOutputBytes:  1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime from bytes: %v", err)
+	}
+	defer rt.Close(context.Background())
+
+	// Compilation is complete, so mutating the caller's slice must not affect
+	// later executions.
+	for i := range data {
+		data[i] = 0
+	}
+	res, err := rt.Execute(context.Background(), Request{Source: "pass", Filename: "main.py"})
+	if err != nil {
+		t.Fatalf("Execute after caller mutation: %v", err)
+	}
+	if res.Status != StatusCompleted {
+		t.Fatalf("status = %q", res.Status)
+	}
+}
+
+func TestNewRuntimeArtifactSourceValidation(t *testing.T) {
+	valid := []byte{0x00, 0x61, 0x73, 0x6d}
+	tests := []struct {
+		name string
+		opts Options
+		want string
+	}{
+		{
+			name: "neither",
+			opts: Options{MaxMemoryBytes: 1, MaxMessageBytes: 1, MaxOutputBytes: 1},
+			want: "artifact path or bytes is required",
+		},
+		{
+			name: "both",
+			opts: Options{ArtifactPath: "x.wasm", ArtifactBytes: valid, MaxMemoryBytes: 1, MaxMessageBytes: 1, MaxOutputBytes: 1},
+			want: "artifact must be either a path or bytes, not both",
+		},
+		{
+			name: "empty bytes",
+			opts: Options{ArtifactBytes: []byte{}, MaxMemoryBytes: 1, MaxMessageBytes: 1, MaxOutputBytes: 1},
+			want: "artifact bytes are empty",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewRuntime(context.Background(), tt.opts)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			we, ok := err.(*Error)
+			if !ok || we.Kind != KindInvalidRequest {
+				t.Fatalf("error = %v", err)
+			}
+			if !strings.Contains(we.Message, tt.want) {
+				t.Fatalf("message = %q, want %q", we.Message, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewRuntimeFromBytesInvalidArtifact(t *testing.T) {
+	_, err := NewRuntime(context.Background(), Options{
+		ArtifactBytes:   []byte("not a wasm module"),
+		MaxMemoryBytes:  16 << 20,
+		MaxMessageBytes: 1 << 20,
+		MaxOutputBytes:  1 << 20,
+	})
+	if err == nil {
+		t.Fatal("expected compile error")
+	}
+	we, ok := err.(*Error)
+	if !ok || we.Kind != KindProtocolError {
+		t.Fatalf("error = %v", err)
+	}
+	if !strings.Contains(we.Message, "compile artifact") {
+		t.Fatalf("message = %q", we.Message)
+	}
+}
+
+func TestNewRuntimePathWithEmptyBytesUsesPath(t *testing.T) {
+	// An empty non-nil byte slice is not a second artifact form; the path is
+	// authoritative. This matches the public layer's len-based validation.
+	rt, err := NewRuntime(context.Background(), Options{
+		ArtifactPath:    filepath.Join("testdata", "completed.wasm"),
+		ArtifactBytes:   []byte{},
+		MaxMemoryBytes:  16 << 20,
+		MaxMessageBytes: 1 << 20,
+		MaxOutputBytes:  1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background())
 }

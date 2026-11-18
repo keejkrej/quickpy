@@ -5,6 +5,7 @@
 # top-level statement: statements after it run before outstanding tools finish.
 
 import asyncio
+import binascii
 import json
 import _quickpy
 
@@ -511,6 +512,130 @@ def _deliver(call_id, ok, value_json, error_json):
         err = json.loads(error_json) if error_json is not None else {}
         del _pending[call_id]
         return fut._reject(err.get("code", "tool_error"), err.get("message", "tool failed"))
+
+
+# ---------------------------------------------------------------------------
+# Optional filesystem facade.
+#
+# quickpy.fs is a thin async wrapper over the host tools fs_read_text,
+# fs_write_text, fs_read_bytes, fs_write_bytes, fs_exists, fs_listdir,
+# fs_mkdir, and fs_remove.  The host decides whether those tools exist and
+# enforces every path and permission rule; the guest only forwards arguments.
+# If the host did not register a tool, the call raises ToolNotFoundError.
+#
+# Methods return plain Python values, not the host's wrapper objects:
+#   read_text(path, encoding="utf-8") -> str
+#   write_text(path, text) -> int (bytes written)
+#   read_bytes(path) -> bytes
+#   write_bytes(path, data) -> int (bytes written)
+#   (write_bytes sends canonical base64 without b2a_base64's trailing newline)
+#   exists(path) -> bool
+#   listdir(path=".") -> list of {"name": str, "type": str, "size": int}
+#   mkdir(path, parents=False) -> bool
+#   remove(path) -> bool
+#
+# Local type errors raise TypeError.  Unexpected keyword arguments raise
+# ToolArgumentError, matching the tool facade.  Host failures stay structured:
+# ToolError and its subclasses propagate unchanged, except that the common
+# filesystem codes are translated for ergonomic use:
+#   not_found -> OSError(2, message)          (.errno == 2)
+#   permission_denied -> OSError(13, message) (.errno == 13)
+#   invalid_path -> ValueError("invalid_path: " + message)
+# This MicroPython ROM level does not define FileNotFoundError or
+# PermissionError, so the facade uses OSError with the conventional errno
+# numbers.  This is not a CPython os emulation layer and does not claim errno
+# parity beyond those two codes.
+# ---------------------------------------------------------------------------
+
+def _fs_no_kwargs(kwargs, tool):
+    for key in kwargs:
+        raise ToolArgumentError(
+            "tool_argument",
+            "unexpected keyword argument: " + str(key),
+            tool=tool,
+        )
+
+
+def _fs_path(path):
+    if not isinstance(path, str):
+        raise TypeError("path must be a string")
+
+
+async def _fs_call(name, **kwargs):
+    try:
+        return await getattr(tools, name)(**kwargs)
+    except ToolError as e:
+        if e.code == "not_found":
+            raise OSError(2, e.message)
+        if e.code == "permission_denied":
+            raise OSError(13, e.message)
+        if e.code == "invalid_path":
+            raise ValueError("invalid_path: " + e.message)
+        raise
+
+
+class _FS:
+    async def read_text(self, path, encoding="utf-8", **kwargs):
+        _fs_no_kwargs(kwargs, "fs_read_text")
+        _fs_path(path)
+        if not isinstance(encoding, str):
+            raise TypeError("encoding must be a string")
+        result = await _fs_call("fs_read_text", path=path, encoding=encoding)
+        return result["text"]
+
+    async def write_text(self, path, text, **kwargs):
+        _fs_no_kwargs(kwargs, "fs_write_text")
+        _fs_path(path)
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        result = await _fs_call("fs_write_text", path=path, text=text)
+        return result["written"]
+
+    async def read_bytes(self, path, **kwargs):
+        _fs_no_kwargs(kwargs, "fs_read_bytes")
+        _fs_path(path)
+        result = await _fs_call("fs_read_bytes", path=path)
+        return binascii.a2b_base64(bytes(result["base64"], "utf-8"))
+
+    async def write_bytes(self, path, data, **kwargs):
+        _fs_no_kwargs(kwargs, "fs_write_bytes")
+        _fs_path(path)
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("data must be bytes or bytearray")
+        # b2a_base64 appends a newline; the host decoder is strict about
+        # whitespace, so send canonical base64 without it.
+        encoded = str(binascii.b2a_base64(data), "utf-8").rstrip("\n")
+        result = await _fs_call("fs_write_bytes", path=path, base64=encoded)
+        return result["written"]
+
+    async def exists(self, path, **kwargs):
+        _fs_no_kwargs(kwargs, "fs_exists")
+        _fs_path(path)
+        result = await _fs_call("fs_exists", path=path)
+        return result["exists"]
+
+    async def listdir(self, path=".", **kwargs):
+        _fs_no_kwargs(kwargs, "fs_listdir")
+        _fs_path(path)
+        result = await _fs_call("fs_listdir", path=path)
+        return result["entries"]
+
+    async def mkdir(self, path, parents=False, **kwargs):
+        _fs_no_kwargs(kwargs, "fs_mkdir")
+        _fs_path(path)
+        if not isinstance(parents, bool):
+            raise TypeError("parents must be a bool")
+        result = await _fs_call("fs_mkdir", path=path, parents=parents)
+        return result["created"]
+
+    async def remove(self, path, **kwargs):
+        _fs_no_kwargs(kwargs, "fs_remove")
+        _fs_path(path)
+        result = await _fs_call("fs_remove", path=path)
+        return result["removed"]
+
+
+fs = _FS()
 
 
 def run(aw):

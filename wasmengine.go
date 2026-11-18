@@ -3,7 +3,6 @@ package quickpy
 import (
 	"context"
 	"errors"
-	"os"
 	"strconv"
 
 	"github.com/keejkrej/quickpy/internal/wasmguest"
@@ -20,37 +19,18 @@ type wasmEngine struct {
 }
 
 func newWasmEngine(ctx context.Context, opts engineOptions) (engine, error) {
-	path := opts.Artifact.Path
-	var cleanup func()
-	if len(opts.Artifact.Bytes) > 0 {
-		f, err := os.CreateTemp("", "quickpy-artifact-*.wasm")
-		if err != nil {
-			return nil, &Error{Kind: KindInvalidRequest, Op: "new", Message: "write artifact: " + err.Error(), Cause: err}
-		}
-		name := f.Name()
-		if _, err := f.Write(opts.Artifact.Bytes); err != nil {
-			_ = f.Close()
-			_ = os.Remove(name)
-			return nil, &Error{Kind: KindInvalidRequest, Op: "new", Message: "write artifact: " + err.Error(), Cause: err}
-		}
-		if err := f.Close(); err != nil {
-			_ = os.Remove(name)
-			return nil, &Error{Kind: KindInvalidRequest, Op: "new", Message: "write artifact: " + err.Error(), Cause: err}
-		}
-		path = name
-		cleanup = func() { _ = os.Remove(name) }
-	}
+	// Artifact bytes are compiled directly from memory. The public layer has
+	// already copied the caller's slice, so no temporary file is created and
+	// no writable TMPDIR is required.
 	rt, err := wasmguest.NewRuntime(ctx, wasmguest.Options{
-		ArtifactPath:    path,
+		ArtifactPath:    opts.Artifact.Path,
+		ArtifactBytes:   opts.Artifact.Bytes,
 		MaxMemoryBytes:  opts.MaxMemoryBytes,
 		MaxMessageBytes: opts.MaxMessageBytes,
 		MaxOutputBytes:  opts.MaxOutputBytes,
 		MaxStateBytes:   opts.MaxStateBytes,
 		DefaultTimeout:  opts.DefaultTimeout,
 	})
-	if cleanup != nil {
-		cleanup()
-	}
 	if err != nil {
 		return nil, mapWasmError(err, "")
 	}

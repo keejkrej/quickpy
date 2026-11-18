@@ -7,6 +7,11 @@ compatibility, or full Prime compatibility. The post-M1 direction is the
 proposed compiled-agent target in [`AGENT_TARGET.md`](AGENT_TARGET.md); it is
 not current scope.
 
+This page is the historical M1 acceptance record. The M2 scripting foundation
+is accepted separately; see [`M2_STATUS.md`](M2_STATUS.md). The M1 artifact
+identity below stays as accepted; later branches may produce a different
+artifact.
+
 ## Final independent verification
 
 The independent verifier reported **GO on all 12 M1 exit criteria** with no
@@ -146,8 +151,9 @@ Covered by the permanent integration suite (independently verified PASS):
   wait for.
 - 100 immediate sequential executions with `MaxExecutions=1` and 10 concurrent
   distinct executions.
-- Empty guest imports, unavailable `os`/`uos`/`gc`/`math` modules, and no guest
-  stdout leak to the host process.
+- Empty guest imports, unavailable `os`/`uos`/`gc` modules, and no guest
+  stdout leak to the host process. Language-only modules such as `math` are
+  allowed and are covered by the scripting corpus.
 - Per-execution memory lower-than-runtime rejection before admission.
 - The opt-in soak workload: 1060 executions, zero errors, stable goroutines.
 
@@ -191,9 +197,10 @@ tests. They are pre-1.0 and not a stability promise.
 - **Zero `MaxToolCalls`:** maps to "no cap" at the public boundary. Internally
   the engine receives an effectively unbounded sentinel; that is an
   implementation detail, not a consumer concern.
-- **`ArtifactSource.Bytes`:** currently written to a temporary file for
-  compilation and cleaned up afterwards. This may be optimized later; it is not
-  part of the contract.
+- **`ArtifactSource.Bytes`:** compiles directly from memory; the earlier
+  temporary-file workaround is gone. This is a post-M1 implementation
+  improvement and is not part of the M1 contract. The M1 artifact identity
+  above remains the historical acceptance record.
 - **`DefaultTimeout == 0`:** means no default timeout, as the spec allows; there
   is no hidden 30-second default.
 - **ABI 4 required:** the host requires ABI 4 and rejects older artifacts rather
@@ -228,5 +235,5 @@ CPython compatibility, or full Prime compatibility.
 - Stable artifact distribution/embedding is future packaging work, not silently
   claimed complete.
 - No pi-go integration and no Zig rewrite.
-- The proposed post-M1 compiled-agent direction is
+- The proposed post-M1/M2 compiled-agent direction is
   [`AGENT_TARGET.md`](AGENT_TARGET.md); it is not current scope.

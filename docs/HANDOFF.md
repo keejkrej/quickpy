@@ -9,22 +9,29 @@ repository is being handed over.
 1. Read [`../README.md`](../README.md) for the short orientation.
 2. Read [`M1_STATUS.md`](M1_STATUS.md) for the accepted M1 evidence, limits, and
    constraints.
-3. Read [`SPEC.md`](SPEC.md) for the intended contract and milestone criteria.
-4. Read [`../guest/M0_NOTES.md`](../guest/M0_NOTES.md) for historical M0 guest
+3. Read [`M2_STATUS.md`](M2_STATUS.md) for the accepted M2 scripting-foundation
+   evidence, limits, and next step.
+4. Read [`SPEC.md`](SPEC.md) for the intended contract and milestone criteria.
+5. Read [`../guest/M0_NOTES.md`](../guest/M0_NOTES.md) for historical M0 guest
    build details, pins, the transient ABI, and evidence.
-5. Read [`../guest/M1_NOTES.md`](../guest/M1_NOTES.md) for the M1 guest
+6. Read [`../guest/M1_NOTES.md`](../guest/M1_NOTES.md) for the M1 guest
    state/output slice, ABI 4, and current artifact evidence.
-6. Read [`../cmd/quickpy-spike/README.md`](../cmd/quickpy-spike/README.md) for
+7. Read [`../guest/SCRIPTING_NOTES.md`](../guest/SCRIPTING_NOTES.md) for the
+   scripting stdlib baseline and the opt-in `quickpy.fs` facade.
+8. Read [`../capability/README.md`](../capability/README.md) for the
+   runtime-neutral filesystem capability v1 contract.
+9. Read [`../cmd/quickpy-spike/README.md`](../cmd/quickpy-spike/README.md) for
    the host CLI and the exact evidence commands.
-7. Check the current git state and the M1 conformance PR (see §9).
-8. Read [`AGENT_TARGET.md`](AGENT_TARGET.md) for the proposed post-M1
-   compiled-agent direction; it is not current scope.
+10. Check the current git state and the M2 PR (see §9).
+11. Read [`AGENT_TARGET.md`](AGENT_TARGET.md) for the proposed post-M2
+    compiled-agent direction; it is not current scope.
 
-QuickPy is an M0-accepted feasibility baseline plus a **full M1-accepted public
-SDK + persistence milestone**. M1 acceptance is a milestone verdict, not
-production GA, a stable 1.0 API, CPython compatibility, or pi-go integration.
-The public entry point is the root `quickpy` package (`api.go`, `runtime.go`,
-`execution.go`, `events.go`, `errors.go`, `value.go`).
+QuickPy is an M0-accepted feasibility baseline, a **full M1-accepted public SDK
++ persistence milestone**, and an **accepted M2 scripting foundation**. M1 and
+M2 acceptance are milestone verdicts, not production GA, a stable 1.0 API,
+CPython compatibility, or pi-go integration. The public entry point is the root
+`quickpy` package (`api.go`, `runtime.go`, `execution.go`, `events.go`,
+`errors.go`, `value.go`).
 
 ## 2. What exists
 
@@ -37,6 +44,11 @@ The public entry point is the root `quickpy` package (`api.go`, `runtime.go`,
 - **Public SDK (M1 accepted, pre-1.0):** the root `quickpy` package wraps the
   low-level host and owns the public value, event, error, and lifecycle types.
   It is accepted as an M1 milestone; see [`M1_STATUS.md`](M1_STATUS.md).
+- **Scripting foundation (M2 accepted):** `json`, `re`, `math`,
+  `io.StringIO`, and `binascii` in the guest, plus the runtime-neutral
+  `capability` core and the opt-in `quickpy.fs` facade. See
+  [`M2_STATUS.md`](M2_STATUS.md) and
+  [`../guest/SCRIPTING_NOTES.md`](../guest/SCRIPTING_NOTES.md).
 - **Spec:** `docs/SPEC.md` defines the public Go contract, guest protocol, error
   taxonomy, limits, and milestones.
 - **Tests:** synthetic host-adapter fixtures under
@@ -95,10 +107,10 @@ go run ./cmd/quickpy-spike -artifact guest/build/quickpy.wasm -mode stall -json
 go run ./cmd/quickpy-spike -artifact guest/build/quickpy.wasm -mode sleep0 -json
 ```
 
-Expected artifact identity for the current M1 build:
+Expected artifact identity for the current M2 scripting-foundation build:
 
-- size: **236,119 bytes**
-- sha256: `171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`
+- size: **256,486 bytes**
+- sha256: `5fdd351a70e0f65a4b812ad21c34a0885f87e839aee7721164768907ad61f50a`
 - ABI: **4** (packed 0.4)
 - MicroPython: **1.29.0**
 - protocol envelope: **0**
@@ -109,14 +121,15 @@ Expected artifact identity for the current M1 build:
 - exports: unchanged (`memory`, `_initialize`, `qp_abi_version`, `qp_alloc`,
   `qp_free`, `qp_invoke`)
 
-A clean-directory rebuild was byte-identical. The M0 artifact identity (195,053
-bytes, sha256
+The M1 artifact identity (236,119 bytes, sha256
+`171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`) is the
+historical M1 acceptance record. The M0 artifact identity (195,053 bytes, sha256
 `4af0bedc33b11101e88cfc4e42a6e4ae187b0db6f079afa3d6e9baa90c738aca`) is
-historical and stale for M1. If a rebuild produces a different hash, record the
-new hash and treat reproducibility as an open item rather than silently
-updating the number. See [`../guest/M1_NOTES.md`](../guest/M1_NOTES.md).
+historical and stale. If a rebuild produces a different hash, record the new
+hash and treat reproducibility as an open item rather than silently updating
+the number. See [`../guest/SCRIPTING_NOTES.md`](../guest/SCRIPTING_NOTES.md).
 
-## 5. Evidence status (M0 historical, M1 accepted)
+## 5. Evidence status (M0 historical, M1/M2 accepted)
 
 **M0:** independent verification returned **GO on all 11 M0 exit criteria**. M0
 is an accepted feasibility baseline, not a production SDK. The M0 numbers below
@@ -149,6 +162,33 @@ Verified for M1:
 - `gofmt`, `go vet`, `go build`, default tests, and default-race pass; repeat
   async/lifecycle runs passed **3×**.
 
+**M2 scripting foundation:** **accepted (independent verification,
+2026-11-19).** The original confidentiality NO-GO was resolved and the focused
+independent gates all pass. This is an accepted scripting foundation, not full
+M2, a polyglot agent, a general OS sandbox, or a JavaScript facade inside
+QuickPy. See [`M2_STATUS.md`](M2_STATUS.md).
+
+Verified for M2:
+
+- Artifact: **256,486 bytes**, SHA-256
+  `5fdd351a70e0f65a4b812ad21c34a0885f87e839aee7721164768907ad61f50a`, ABI
+  **4**, MicroPython **1.29.0**, **zero** WASI imports, **1** EH tag,
+  **64/1024** memory pages, **4 MiB** guest heap.
+- Guest smoke: **135/135** checks pass, **94/94** instances closed.
+- `go vet`, `go build`, `CGO_ENABLED=0 go test`, and the default suite pass;
+  `gofmt` diff check is clean; `go test -race ./capability/...` and the
+  sanitizer race pass.
+- Real-artifact integration passes all tests except the opt-in `QUICKPY_SOAK`
+  test. Post-sanitizer targeted workspace tests: **3/3** in **0.465 s**. Race
+  representatives: **12 tests** in **29.3 s**.
+- Native embedded example: direct `ArtifactSource.Bytes`, no writable `TMPDIR`,
+  `CGO_ENABLED=0`, validated against the current artifact via an overlay. A
+  linux/amd64 tagged cross-build was built but not executed. A stripped
+  darwin/arm64 build measured 6,507,490 bytes with an earlier 251,590-byte
+  artifact; that is historical and run-specific, not a current size guarantee.
+- No actual device `EIO` fault was simulated; that is a coverage limitation,
+  not a current defect.
+
 Verified for M0 on the development machine:
 
 - MicroPython v1.29.0 builds to a reactor WASI module with Zig 0.17.1 and
@@ -175,29 +215,31 @@ Verified for M0 on the development machine:
   run. This is a process-level, approximate measurement; the spike CLI's own
   run reported ~13.1–13.6 MiB per instance.
 
-For current M1 status, use [`M1_STATUS.md`](M1_STATUS.md) and
-[`../guest/M1_NOTES.md`](../guest/M1_NOTES.md). Re-read them before quoting
-status, but do not treat a stale “pending” line as a new blocker without
-re-running the evidence.
+For the accepted M1 status, use [`M1_STATUS.md`](M1_STATUS.md) and
+[`../guest/M1_NOTES.md`](../guest/M1_NOTES.md). For the current branch, use
+[`M2_STATUS.md`](M2_STATUS.md). Re-read them before quoting status, but do not
+treat a stale “pending” line as a new blocker without re-running the evidence.
 
-## 6. Immediate next steps for a new agent (post-M1)
+## 6. Immediate next steps for a new agent (post-M2)
 
-1. Confirm the M1 conformance PR is merged and `main` contains the accepted M1
-   source (see §9).
+1. Confirm the M2 scripting-foundation PR is merged and `main` contains the
+   accepted M2 source (see §9). M0/M1 stay historical.
 2. Run the clean-clone build and verification commands in §4, including the
-   gated integration suite and the opt-in soak, to confirm the artifact on the
-   new machine.
-3. Start **post-M1 corpus packaging** per
-   [`AGENT_TARGET.md`](AGENT_TARGET.md):
-   - define the acceptance corpus and the supported module facade;
-   - build the separate Go agent application composing `pi-go/agent`, selected
-     `pi-go/ai` provider code, and the QuickPy SDK;
-   - keep **CodeMode** default-deny and **AgentScript** opt-in;
-   - do not rewrite the engine or add unbounded wrappers.
-4. Keep the M0/M1 evidence reproducible; do not regress the accepted baselines.
-5. Stable artifact distribution/embedding remains future packaging work.
-6. Only after the post-M1 corpus and M2 hardening should pi-go integration be
-   treated as shipped.
+   gated real-artifact integration suite and the guest smoke harness (135
+   checks, 94/94 instances closed).
+3. Start the **`script-agent` test field** and polyglot composition against the
+   accepted runtime-neutral capability contract:
+   - reuse the versioned operation/error contract rather than inventing a
+     parallel one;
+   - a new Zig adapter is optional; do not rewrite the existing engine or add
+     unbounded wrappers;
+   - keep CodeMode default-deny and AgentScript opt-in.
+4. Do **not** include or upstream local pi-go changes. The pi-go prototype is a
+   local reference only; this repository does not edit pi-go, pi-rs, or pi-ts.
+5. Keep the M0/M1/M2 evidence reproducible; do not regress the accepted
+   baselines.
+6. Stable artifact distribution/embedding remains future packaging work. The
+   `go:embed` example is a build recipe, not a distribution contract.
 
 ## 7. Known hard requirements and limitations
 
@@ -216,13 +258,23 @@ re-running the evidence.
   `return`. Statements after `quickpy.run(...)` run before pending tools finish.
 - **Serialized guest entry:** concurrent async tools are dispatched by the
   host, but only the owner re-enters the guest. No concurrent export entry.
-- **No host capabilities:** no filesystem, network, environment, or process
-  access. No OS process isolation; WASM is a memory/capability boundary.
+- **No ambient host capabilities:** no ambient filesystem, network,
+  environment, or process access. No OS process isolation; WASM is a
+  memory/capability boundary. An opt-in, workspace-scoped filesystem
+  capability exists (see [`M2_STATUS.md`](M2_STATUS.md)); it is not ambient
+  `os`/`open` access.
+- **M2 scripting-foundation scope:** accepted as a scripting foundation, not
+  full M2, a polyglot agent, a general OS sandbox, or a JavaScript facade
+  inside QuickPy. Hardlinks, bind mounts, devices, and FIFOs remain host
+  responsibilities; there is no `fsync` or crash durability; CAPv1 is an
+  in-process data ABI, not a network protocol. The `script-agent` test field is
+  the next consumer for new language facades.
 - **Trusted tools:** tool implementations are trusted. A malicious trusted tool
   can do anything the host permits.
-- **Narrow frozen modules:** `math`, `uos`, and `gc` are not available in the
-  current guest build. `json`, `time` (for loud timer rejection), `sys`, and
-  `io.StringIO` are available.
+- **Narrow frozen modules:** `uos` and `gc` are not available in the current
+  guest build. `json`, `re`, `math`, `io.StringIO`, `binascii`, `time` (for
+  loud timer rejection), and `sys` are available. See
+  [`../guest/SCRIPTING_NOTES.md`](../guest/SCRIPTING_NOTES.md).
 - **Memory cap scope:** `MaxMemoryBytes` is applied at the wazero runtime level,
   not per instance (wazero API limitation). A per-execution
   `ExecuteRequest.MaxMemoryBytes` must be zero (inherit) or exactly equal to the
@@ -238,10 +290,11 @@ re-running the evidence.
   `await`/`return`; narrow MicroPython module surface; per-execution memory
   below the runtime cap is rejected; no OS process isolation; tool
   implementations are trusted.
-- **Post-M1 work (not M1 conformance gates):** stable artifact
+- **Post-M2 work (not M2 conformance gates):** stable artifact
   distribution/embedding, the proposed [`AGENT_TARGET.md`](AGENT_TARGET.md)
   corpus/agent application, OS wrappers as future `AgentScript` default-deny
-  work, and pi-go integration.
+  work, and pi-go integration. Local pi-go changes are not included or
+  upstreamed by this repository.
 - **M1 memory numbers:** the current guest uses a 4 MiB heap and 4 MiB initial
   linear memory. See [`../guest/M1_NOTES.md`](../guest/M1_NOTES.md) and
   [`../integration/SOAK.md`](../integration/SOAK.md). Do not reuse M0
@@ -284,21 +337,34 @@ M1 history:
   and was merged into `main` at `459e9642055380e4d8e946d6c06418c91eed89ae`.
   That PR was an increment, not full M1 acceptance.
 
-Current M1 conformance work:
+M1 conformance history:
 
-- Branch: `m1/conformance`, based on `main` at `459e964` (the PR #2 merge).
+- PR **#3** (`m1/conformance`) delivered full M1 acceptance and was merged into
+  `main` at `bc0f7d4117e11440a49c29be421d4eaae917e639`.
 - Independent verification returned **GO on all 12 M1 exit criteria** on
   **2026-11-18**: the real artifact rebuilt byte-identically, the default and
   race suites passed, the real-artifact integration suite passed, guest smoke
-  passed 118/118 with 78/78 instances closed, and the opt-in soak passed. No
-  blocking issues were reported.
-- The increment is published as PR **#3**:
-  <https://github.com/keejkrej/quickpy/pull/3> (base `main`, head
-  `m1/conformance`). At the time of this amendment the PR is open and pending
-  merge; use `gh pr view 3 --json state,mergeCommit` to resolve the final merge
-  result.
+  passed 118/118 with 78/78 instances closed, and the opt-in soak passed.
 - This is **full M1 acceptance as a milestone**, not production GA, a stable
   1.0 API, CPython compatibility, or full Prime compatibility.
+
+Current M2 work:
+
+- Branch: `m2/scripting-foundation`, based on the merged M1 `main` at
+  `bc0f7d4`.
+- Independent verification returned **GO on the focused M2 gates** on
+  **2026-11-19**: the original confidentiality NO-GO was resolved, the
+  sanitizer and race gates pass, guest smoke passes 135/135 with 94/94
+  instances closed, and the real-artifact integration suite passes except the
+  opt-in soak.
+- The revision is published as PR **#4**:
+  <https://github.com/keejkrej/quickpy/pull/4> (base `main`, head
+  `m2/scripting-foundation`). At the time of this amendment the PR is open and
+  pending merge; use `gh pr view 4 --json state,mergeCommit` to resolve the
+  final merge result.
+- This is an **accepted M2 scripting foundation**, not full M2, a polyglot
+  agent, a general OS sandbox, or a JavaScript facade inside QuickPy. Local
+  pi-go changes are not included or upstreamed.
 
 Staging must use explicit paths, never `git add -A`. Exclude `guest/build/`,
 `guest/.cache/`, logs, temp files, and local binaries. The synthetic

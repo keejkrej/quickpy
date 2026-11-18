@@ -753,7 +753,7 @@ opt-in soak of 1060 executions in 27.84 s with zero errors and stable
 goroutines. This is a milestone acceptance, not production GA, a stable 1.0 API,
 CPython compatibility, or full Prime compatibility. Current pieces, limits, and
 accepted constraints are tracked in [`M1_STATUS.md`](M1_STATUS.md); the proposed
-post-M1 direction is [`AGENT_TARGET.md`](AGENT_TARGET.md).
+post-M2 direction is [`AGENT_TARGET.md`](AGENT_TARGET.md).
 
 Exit criteria:
 
@@ -771,6 +771,12 @@ Exit criteria:
 12. The 6.6.1 resource/trap matrix is covered by tests, including `StateWritten` and `ErrWaitTimeout` behavior.
 
 ### M2 — pi-go integration and hardening
+
+**Status note:** the accepted *M2 scripting foundation* (scripting stdlib,
+runtime-neutral filesystem capability, opt-in `quickpy.fs`) is a sub-increment.
+It does not complete this M2 milestone: pi-go integration, full hardening, and
+the polyglot/agent application remain future work. See
+[`M2_STATUS.md`](M2_STATUS.md).
 
 - pi-go implements `ExecuteCodemode` on the SDK, converts agent tools, applies policy/defaults, renders outputs, and accounts usage, without importing WASM details.
 - Soak tests, crash/trap classification, timeout/cancel latency, and protocol fuzz coverage.

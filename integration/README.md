@@ -15,8 +15,16 @@ or the Zig/MicroPython build toolchain.
   paths are resolved from the repository root, so `guest/build/quickpy.wasm`
   works from any working directory.
 
-The final M1 reference artifact is ABI 4: 236,119 bytes with SHA-256
-`171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`. The
+The current M2 scripting-foundation artifact is ABI 4: **256,486 bytes** with
+SHA-256
+`5fdd351a70e0f65a4b812ad21c34a0885f87e839aee7721164768907ad61f50a`. It adds
+the scripting stdlib baseline and the inert `quickpy.fs` facade; see
+[`../guest/SCRIPTING_NOTES.md`](../guest/SCRIPTING_NOTES.md). The accepted M1
+reference artifact was 236,119 bytes with SHA-256
+`171502b0e072d03402672f75ea7c35e651341518d0f452c533995c7106372184`. The earlier
+scripting-baseline artifact (JSON/re/math/io.StringIO/binascii, still ABI 4 and
+zero imports) was 251,590 bytes with SHA-256
+`fde6f80ae8775997360f09ca61e0a994f224f4f8f99e4a79811983b8e216af82`. The
 previously recorded ABI 3 artifact was 227,717 bytes with SHA-256
 `a20ca657e77364104902dff759c8be42c964e2cd9fe8f21c97102a606c11a4fc`. The tests
 log the observed size and hash and require ABI 4 with zero WASI imports; they do
@@ -68,8 +76,10 @@ QUICKPY_TEST_ARTIFACT=guest/build/quickpy.wasm QUICKPY_SOAK=1 \
   closers, short-context early return, and a noncooperative tool that `Close`
   must not wait for.
 - Capacity, per-execution memory rejection before admission, empty guest
-  imports, unavailable `os`/`uos`/`gc`/`math` modules, and no guest stdout leak
-  to the host process.
+  imports, unavailable `os`/`uos`/`gc` modules, and no guest stdout leak to the
+  host process. The negative module list is about ambient OS/process access,
+  not pure computation: language-only modules such as `math` are allowed and
+  are covered by the scripting corpus.
 
 ### Structured console and image output (ABI 4)
 
@@ -137,6 +147,70 @@ QUICKPY_TEST_ARTIFACT=guest/build/quickpy.wasm QUICKPY_SOAK=1 \
   an oversized result is `LimitExceeded`. Each failure leaves the runtime
   healthy for the next execution.
 
+### Scripting corpus (compiled-agent target)
+
+[`../guest/SCRIPTING_NOTES.md`](../guest/SCRIPTING_NOTES.md) records the
+ordinary Python-C-style scripting corpus and its observed support matrix. The
+tests are top-level scripts, not agent-API examples, and they do not claim a
+persistent REPL. They cover:
+
+- `json` loads/dumps with Unicode, nesting, `None`/`true`/`false`, and float64
+  numeric output. Dict order is MicroPython hash order, so assertions are
+  semantic rather than CPython byte-exact.
+- `re` groups/search/sub and a clean `ValueError("error in regex")` pattern
+  error; compiled-pattern `split`/`sub`; module-level `split`/`findall` are
+  recorded as clean unsupported when absent.
+- `math` sqrt/floor/trig accuracy and a clean domain error.
+- `io.StringIO` text funnel; `csv` and `textwrap` are recorded as clean
+  unsupported when the frozen modules are absent.
+- `binascii` hex/base64 round trips that preserve NUL and `0xff` bytes, with
+  bytes and text inputs.
+- Default-deny: `subprocess`/`pathlib`/`os`/`uos`/`gc`/`socket`/`shutil`/
+  `tempfile`/`threading`/`multiprocessing` are unimportable, `open()` is a
+  clean `OSError`, `quickpy.fs` is present but inert (every method is a
+  catchable `ToolNotFoundError` when no host `fs_*` tools are registered), and
+  unregistered tool calls are catchable `ToolNotFoundError` values that create
+  no files, change no host environment, and leak no host data.
+- Honest identity and freshness: `sys.version` identifies MicroPython,
+  `sys.implementation` reports the wasm32 guest, guest imports are empty,
+  globals and imports are fresh per call, and state is explicit
+  (`InitialState`/`set_state`) rather than an implicit persistent REPL.
+- Filesystem read/write through ambient `open()` is cleanly unsupported; the
+  practical future `fs_*` wrapper names are denied rather than silently
+  succeeding. The opt-in `quickpy.fs` facade is covered separately below. This
+  is evidence for the wrapper layer, not a claim that ambient filesystem
+  support exists.
+
+### Opt-in workspace filesystem (M2 scripting foundation, accepted)
+
+[`workspace_test.go`](workspace_test.go) exercises the full stack: the
+runtime-neutral [`capability`](../capability/README.md) core, the
+`quickpybridge.Install` adapter, the guest `quickpy.fs` facade, and the real
+artifact. The core contract is documented in
+[`../capability/README.md`](../capability/README.md).
+
+- `TestWorkspaceFilesystemOperationsPersist` covers `mkdir` (including
+  `parents=True` idempotence), text and binary writes, `exists`, `listdir`
+  entry shape, `remove`, and a second execution that reads the persisted host
+  files. Unicode text and NUL/`0xff` binary bytes round-trip. Guest globals are
+  still fresh per execution; only the host files persist.
+- `TestWorkspaceReadOnlyAndContainment` covers explicit `ReadOnly: true`
+  denial of every mutation, `..` traversal and absolute-path rejection, and an
+  outside sentinel that is never read or written. The host root path is not
+  disclosed in operation errors. Symlink containment is covered at the
+  capability layer by [`../capability/security_test.go`](../capability/security_test.go),
+  not by this integration test.
+- `TestWorkspaceSideEffectsNotRolledBack` writes a file and then raises a
+  Python exception, proving the host side effect persists and is not rolled
+  back.
+- `TestWorkspaceFilesystemOperationsPersist` also exercises `asyncio.gather`
+  over `quickpy.fs` calls. There is no multi-operation transaction; a failed
+  later statement does not roll back an earlier successful write.
+
+These tests are real-artifact evidence for the accepted M2 scripting
+foundation. They do not claim full M2, a polyglot agent, or full secure OS
+isolation; see the known limitations in [`../capability/README.md`](../capability/README.md).
+
 ### Supported `asyncio` subset
 
 The normative matrix is in [`ASYNCIO.md`](ASYNCIO.md). The executable evidence
@@ -154,6 +228,8 @@ final ABI 4 reference run: 1060 executions in 32.51 s, zero errors, per-batch
 RSS, goroutine, and allocation trends, and the cancellation/late-handler check.
 The test fails only on a clearly monotonic, large resource increase across
 comparable batches; a single RSS sample is not treated as a memory-bound proof.
+Skipping the soak is reasonable for an ordinary correctness pass; run it when
+resource behavior is the question.
 
 ## Known synthetic-only or future coverage
 
@@ -174,6 +250,9 @@ These are not claimed as real-artifact coverage by this suite:
   supported.
 - The guest heap is 4 MiB and linear memory is capped at 64 MiB; the soak test
   records process RSS but does not claim a memory bound.
+- Filesystem read/write through ambient `open()` is unsupported. The opt-in
+  `quickpy.fs` facade is covered by the workspace tests above; it is not an
+  ambient filesystem profile and does not claim full M2 or polyglot completion.
 - A stable artifact distribution/embedding contract and pi-go integration are
   future work.
 
@@ -188,8 +267,11 @@ host/guest output protocol, not the MicroPython version.
 
 ## Test inventory
 
-The package has 73 top-level test functions. 11 of them are ABI 4-gated
-(`requireABI4`) and skip on an older artifact; the ABI 3 tool-conformance
-suites accept ABI 3 or newer so they still run against the final ABI 4
-artifact. The opt-in `TestSoak` is counted separately and is skipped unless
-`QUICKPY_SOAK` is set.
+The package has 85 top-level test functions, including the opt-in `TestSoak`
+(84 run by default; `TestSoak` is skipped unless `QUICKPY_SOAK` is set). 11 of
+the 85 are ABI 4-gated (`requireABI4`) and skip on an older artifact; the ABI 3
+tool-conformance suites accept ABI 3 or newer so they still run against the
+final ABI 4 artifact. Nine of the 85 are the scripting corpus in
+`scripting_corpus_test.go`; they are adaptive and record clean unsupported
+results instead of skipping. Three are the opt-in workspace filesystem tests
+in `workspace_test.go`.

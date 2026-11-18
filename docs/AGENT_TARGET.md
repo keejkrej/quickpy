@@ -1,8 +1,10 @@
 # Agent target: a compiled Prime-inspired scripting agent
 
-**Status:** proposed north star, after M1. This is not M1 scope, not a
-commitment, and not a compatibility claim. QuickPy remains a generic execution
-runtime; the agent application described here is a separate future consumer.
+**Status:** proposed north star, after the accepted M2 scripting foundation.
+This is not M2 scope, not a commitment, and not a compatibility claim. QuickPy
+remains a generic execution runtime; the agent application described here is a
+separate future consumer. The `script-agent` test field is the next composition
+target.
 
 ## 1. Primary-source inspection
 
@@ -79,14 +81,27 @@ bridge rather than added as a native host addon.
 - The host enforces path and security policy.
 - No ambient root mounts.
 
+The runtime-neutral [`../capability/README.md`](../capability/README.md) v1
+contract is the first concrete piece of this direction: eight versioned
+filesystem operations with a closed error-code set, implemented with only the
+Go standard library and `os.Root`. QuickPy consumes it explicitly through
+`capability/quickpybridge`; a future Zig, JavaScript, or Bash facade should
+target the same operation/error contract rather than inventing a parallel one.
+This does not hide or replace the Zig path; it gives every language frontend a
+shared, testable core.
+
 This is a design direction, not implemented behavior. It needs protocol,
-lifecycle, and security tests before it can be claimed.
+lifecycle, and security tests before it can be claimed. No JavaScript `node:fs`
+facade, Bash facade, Zig facade, or general CPython `os` support exists yet.
 
 ## 5. Packaging and measurement
 
-- `ArtifactSource.Bytes` currently writes a temporary file for compilation.
-  `go:embed` is supported. A later internal bytes cache should avoid requiring
-  a writable temp directory.
+- `ArtifactSource.Bytes` now compiles directly from memory; the earlier
+  temporary-file workaround is gone. The `examples/embed/` reference proves a
+  `go:embed` build runs with no artifact file and no writable `TMPDIR`.
+- The embedded asset is still a generated, gitignored build input. This is a
+  build recipe, not an artifact distribution contract or a versioned release
+  channel.
 - CI should pin the exact guest ABI and artifact hash.
 - Record, without guessed numbers: executable total installed footprint, cold
   `PyReady`, cold and warm RSS, and the same figures for Prime including its
@@ -103,7 +118,7 @@ The compiled-agent MVP should be accepted against a corpus containing:
 - Actual sanitized user `python -c` snippets.
 - Deny cases for escapes and network access.
 
-## 7. Sequencing after M1 acceptance
+## 7. Sequencing after M1/M2 acceptance
 
 Start with only:
 
@@ -111,7 +126,17 @@ Start with only:
 2. packaging,
 3. one agent loop with a deterministic provider.
 
+The accepted M2 scripting foundation has already started the corpus and the
+runtime-neutral filesystem core. The next optional step is the `script-agent`
+test field and language frontends (JavaScript and Bash first) over the same
+versioned operation/error contract, before any full Prime-style UI or daemon.
 Do not start the daemon, TUI, plugin system, or full provider matrix first.
+
+The application described here is a separate future consumer; it is not named
+`quickpy` and does not change QuickPy's scope. The recommended source shape
+remains a Go agent loop composing `pi-go/agent`, selected `pi-go/ai` provider
+code, and the QuickPy SDK. The user-created `script-agent` test field is the
+next consumer; no application repository is part of this QuickPy revision.
 
 ## 8. Licensing caveat
 

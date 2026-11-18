@@ -130,7 +130,9 @@ func TestGuestImportsAndModules(t *testing.T) {
 	if len(res.Guest.Imports) != 0 {
 		t.Fatalf("guest imports = %+v, want none", res.Guest.Imports)
 	}
-	for _, module := range []string{"os", "uos", "gc", "math"} {
+	// Language-only modules such as math are allowed; this negative list is
+	// about ambient OS/process capabilities, not pure computation.
+	for _, module := range []string{"os", "uos", "gc"} {
 		t.Run(module, func(t *testing.T) {
 			res, err := wait(t, execute(t, r, quickpy.ExecuteRequest{
 				Source: fmt.Sprintf(`try:

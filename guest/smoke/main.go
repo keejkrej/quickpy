@@ -1770,6 +1770,319 @@ quickpy.set_state({"n": 2})`))
 			res.Outputs[0].Type == "console" && res.Outputs[1].Type == "image",
 		fmt.Sprintf("err=%v %s", err, describe(res)))
 
+	// ---------------------------------------------------------------------
+	// Scripting stdlib baseline: json, re, math, io.StringIO, binascii.
+	// These are pure language/data modules; no ambient capabilities.
+	// ---------------------------------------------------------------------
+
+	jsonInst := fresh()
+	res, err = jsonInst.invokeJSON(ctx, startRequest(`import json
+d = {"a": [1, 2.5, "x"], "b": True, "c": None}
+d2 = json.loads(json.dumps(d))
+print(d2["a"][0], d2["a"][1], d2["a"][2], d2["b"], d2["c"])
+print(isinstance(json.loads("1"), int), isinstance(json.loads("1.0"), float), isinstance(json.loads("1"), float))`))
+	check("json nested roundtrip and int/float distinction",
+		err == nil && res.Type == "completed" &&
+			res.Output == "1 2.5 x True None\nTrue True False\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	jsonUni := fresh()
+	res, err = jsonUni.invokeJSON(ctx, startRequest(`import json
+s = json.dumps({"k": "héllo\u2603"})
+print(s)
+print(json.loads(s)["k"])
+print(len("héllo"), "héllo"[1])`))
+	check("json unicode dumps/loads and str code points",
+		err == nil && res.Type == "completed" &&
+			res.Output == "{\"k\": \"héllo☃\"}\nhéllo☃\n5 é\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	jsonNonFinite := fresh()
+	res, err = jsonNonFinite.invokeJSON(ctx, startRequest(`import json
+print(json.dumps(float("inf")), json.dumps(float("nan")))
+try:
+    json.loads("Infinity")
+except ValueError:
+    print("rejected")`))
+	check("json non-finite dumps emits bare inf/nan and loads rejects",
+		err == nil && res.Type == "completed" &&
+			res.Output == "inf nan\nrejected\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	reInst := fresh()
+	res, err = reInst.invokeJSON(ctx, startRequest(`import re
+m = re.match(r"(\w+)-(\d+)", "abc-123")
+print(m.group(0), m.group(1), m.group(2), m.groups(), m.span())
+print(re.sub(r"\d+", "#", "a1b22c333"))
+print(re.sub(r"(\w+)", lambda mm: mm.group(1).upper(), "ab cd"))
+print(re.search(r"b+", "aabbbcc").group(0))
+print(re.compile(r",\s*").split("a, b,c"))
+print(hasattr(re, "split"))`))
+	check("re match/groups/span/sub/search/split",
+		err == nil && res.Type == "completed" &&
+			res.Output == "abc-123 abc 123 ('abc', '123') (0, 7)\na#b#c#\nAB CD\nbbb\n['a', 'b', 'c']\nFalse\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	reErr := fresh()
+	res, err = reErr.invokeJSON(ctx, startRequest(`import re
+try:
+    re.compile("(")
+except ValueError as e:
+    print("regex error", e)`))
+	check("re compile error caught as ValueError",
+		err == nil && res.Type == "completed" &&
+			res.Output == "regex error error in regex\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	reUncaught := fresh()
+	res, err = reUncaught.invokeJSON(ctx, startRequest(`import re
+re.compile("(")`))
+	check("re compile error uncaught is clean Script failure",
+		err == nil && res.Type == "failed" && res.Error != nil &&
+			res.Error.Type == "ValueError" && res.Error.Message == "error in regex",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	mathInst := fresh()
+	res, err = mathInst.invokeJSON(ctx, startRequest(`import math
+print(abs(math.sqrt(2) - 1.4142135623730951) < 1e-15)
+print(math.sin(0), math.cos(0), math.floor(2.9), math.ceil(2.1))
+print(math.pow(2, 10), math.log(math.e), math.fabs(-3.5), math.trunc(-2.9))
+print(math.isfinite(1.0), math.isinf(float("inf")), math.isnan(float("nan")))
+print(0.1 + 0.2 == 0.3)
+print(abs((0.1 + 0.2) - 0.3) < 1e-16)`))
+	check("math double-precision known values",
+		err == nil && res.Type == "completed" &&
+			res.Output == "True\n0.0 1.0 2 3\n1024.0 1.0 3.5 -2\nTrue True True\nFalse\nTrue\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	ioInst := fresh()
+	res, err = ioInst.invokeJSON(ctx, startRequest(`import io
+s = io.StringIO()
+n1 = s.write("hello ")
+n2 = s.write("world")
+print(n1, n2, s.getvalue())
+print(io.StringIO("init").read())`))
+	check("io.StringIO in-memory text",
+		err == nil && res.Type == "completed" &&
+			res.Output == "6 5 hello world\ninit\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	binInst := fresh()
+	res, err = binInst.invokeJSON(ctx, startRequest(`import binascii
+data = b"\x00\x01\xff\xfe"
+b64 = binascii.b2a_base64(data)
+print(binascii.a2b_base64(b64) == data)
+h = binascii.hexlify(data)
+print(h)
+print(binascii.unhexlify(h) == data)
+print(binascii.unhexlify("00ff"))`))
+	check("binascii base64/hex NUL/FF roundtrip",
+		err == nil && res.Type == "completed" &&
+			res.Output == "True\nb'0001fffe'\nTrue\nb'\\x00\\xff'\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	openInst := fresh()
+	res, err = openInst.invokeJSON(ctx, startRequest(`try:
+    open("x")
+except OSError as e:
+    print("open blocked", e)`))
+	check("open still raises OSError",
+		err == nil && res.Type == "completed" &&
+			res.Output == "open blocked open is not supported\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	noAmbient := fresh()
+	res, err = noAmbient.invokeJSON(ctx, startRequest(`for name in ("os", "pathlib", "subprocess"):
+    try:
+        __import__(name)
+        print(name, "unexpected")
+    except ImportError:
+        print(name, "blocked")`))
+	check("no os/pathlib/subprocess imports",
+		err == nil && res.Type == "completed" &&
+			res.Output == "os blocked\npathlib blocked\nsubprocess blocked\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	// ---------------------------------------------------------------------
+	// Optional quickpy.fs facade.  The harness is the fake host: it answers
+	// the fs_* tool calls with plain maps, exactly like the Go bridge would.
+	// ---------------------------------------------------------------------
+
+	fsInst := fresh()
+	res, err = fsInst.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+
+async def main():
+    text = await quickpy.fs.read_text("a.txt")
+    n = await quickpy.fs.write_text("b.txt", "hello")
+    data = await quickpy.fs.read_bytes("c.bin")
+    n2 = await quickpy.fs.write_bytes("d.bin", b"\x00\x01\xff")
+    ok = await quickpy.fs.exists("a.txt")
+    entries = await quickpy.fs.listdir()
+    created = await quickpy.fs.mkdir("sub", parents=True)
+    removed = await quickpy.fs.remove("b.txt")
+    print(text, n, data, n2, ok, created, removed)
+    print(entries[0]["name"], entries[0]["type"], entries[0]["size"])
+    print(entries[1]["name"], entries[1]["type"], entries[1]["size"])
+
+quickpy.run(main())`))
+	fsValues := map[string]any{
+		"fs_read_text":   map[string]any{"text": "hello"},
+		"fs_write_text":  map[string]any{"written": float64(5)},
+		"fs_read_bytes":  map[string]any{"base64": "AAH/"},
+		"fs_write_bytes": map[string]any{"written": float64(3)},
+		"fs_exists":      map[string]any{"exists": true},
+		"fs_listdir": map[string]any{"entries": []any{
+			map[string]any{"name": "a.txt", "type": "file", "size": float64(5)},
+			map[string]any{"name": "sub", "type": "directory", "size": float64(0)},
+		}},
+		"fs_mkdir":  map[string]any{"created": true},
+		"fs_remove": map[string]any{"removed": true},
+	}
+	var fsCalls []call
+	for res.Type == "suspended" && len(res.Calls) == 1 {
+		c := res.Calls[0]
+		fsCalls = append(fsCalls, c)
+		val, ok := fsValues[c.Name]
+		if !ok {
+			break
+		}
+		res, err = fsInst.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": c.ID, "ok": true, "value": val},
+		}, false))
+	}
+	check("fs facade methods return plain values",
+		err == nil && res.Type == "completed" &&
+			res.Output == "hello 5 b'\\x00\\x01\\xff' 3 True True True\na.txt file 5\nsub directory 0\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+	check("fs facade forwards exact tool names and args",
+		len(fsCalls) == 8 &&
+			fsCalls[0].Name == "fs_read_text" && fsCalls[0].Args["path"] == "a.txt" && fsCalls[0].Args["encoding"] == "utf-8" &&
+			fsCalls[1].Name == "fs_write_text" && fsCalls[1].Args["path"] == "b.txt" && fsCalls[1].Args["text"] == "hello" &&
+			fsCalls[2].Name == "fs_read_bytes" && fsCalls[2].Args["path"] == "c.bin" &&
+			fsCalls[3].Name == "fs_write_bytes" && fsCalls[3].Args["path"] == "d.bin" && fsCalls[3].Args["base64"] == "AAH/" &&
+			fsCalls[4].Name == "fs_exists" && fsCalls[4].Args["path"] == "a.txt" &&
+			fsCalls[5].Name == "fs_listdir" && fsCalls[5].Args["path"] == "." &&
+			fsCalls[6].Name == "fs_mkdir" && fsCalls[6].Args["path"] == "sub" && fsCalls[6].Args["parents"] == true &&
+			fsCalls[7].Name == "fs_remove" && fsCalls[7].Args["path"] == "b.txt",
+		fmt.Sprintf("calls=%+v", fsCalls))
+
+	fsErrInst := fresh()
+	res, err = fsErrInst.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+
+async def main():
+    try:
+        await quickpy.fs.read_text("missing")
+    except OSError as e:
+        print("notfound", e.errno)
+    try:
+        await quickpy.fs.read_text("denied")
+    except OSError as e:
+        print("denied", e.errno)
+    try:
+        await quickpy.fs.read_text("bad")
+    except ValueError as e:
+        print("invalid", e)
+    try:
+        await quickpy.fs.read_text("unknown")
+    except quickpy.ToolError as e:
+        print("toolerror", e.code)
+
+quickpy.run(main())`))
+	fsErrs := []map[string]any{
+		{"code": "not_found", "message": "missing"},
+		{"code": "permission_denied", "message": "denied"},
+		{"code": "invalid_path", "message": "bad"},
+		{"code": "io_error", "message": "boom"},
+	}
+	var fsErrOutput string
+	for i := 0; res.Type == "suspended" && len(res.Calls) == 1 && i < len(fsErrs); i++ {
+		c := res.Calls[0]
+		res, err = fsErrInst.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": c.ID, "ok": false, "error": fsErrs[i]},
+		}, false))
+		fsErrOutput += res.Output
+	}
+	check("fs facade maps common host error codes",
+		err == nil && res.Type == "completed" &&
+			fsErrOutput == "notfound 2\ndenied 13\ninvalid invalid_path: bad\ntoolerror io_error\n",
+		fmt.Sprintf("err=%v %s output=%q", err, describe(res), fsErrOutput))
+
+	fsMissingInst := fresh()
+	res, err = fsMissingInst.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+
+async def main():
+    try:
+        await quickpy.fs.read_text("x")
+    except quickpy.ToolNotFoundError as e:
+        print("notfound", e.code)
+
+quickpy.run(main())`))
+	if res.Type == "suspended" && len(res.Calls) == 1 {
+		res, err = fsMissingInst.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": res.Calls[0].ID, "ok": false, "error": map[string]any{"code": "tool_not_found", "message": "unknown tool"}},
+		}, false))
+	}
+	check("fs facade unregistered tool stays ToolNotFoundError",
+		err == nil && res.Type == "completed" && res.Output == "notfound tool_not_found\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	fsTypeInst := fresh()
+	res, err = fsTypeInst.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+
+async def main():
+    try:
+        await quickpy.fs.write_bytes("x", "not bytes")
+    except TypeError:
+        print("type")
+    try:
+        await quickpy.fs.read_text("x", bogus=1)
+    except quickpy.ToolArgumentError:
+        print("kwarg")
+    try:
+        await quickpy.fs.mkdir("x", parents="yes")
+    except TypeError:
+        print("parents")
+
+quickpy.run(main())`))
+	check("fs facade validates local types and kwargs",
+		err == nil && res.Type == "completed" && len(res.Calls) == 0 &&
+			res.Output == "type\nkwarg\nparents\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
+	fsGatherInst := fresh()
+	res, err = fsGatherInst.invokeJSON(ctx, startRequest(`import asyncio, quickpy
+
+async def main():
+    a, b = await asyncio.gather(quickpy.fs.read_text("a"), quickpy.fs.exists("b"))
+    print(a, b)
+
+quickpy.run(main())`))
+	fsGatherOK := err == nil && res.Type == "suspended" && len(res.Calls) == 2
+	var fsRead, fsExists call
+	if fsGatherOK {
+		for _, c := range res.Calls {
+			switch c.Name {
+			case "fs_read_text":
+				fsRead = c
+			case "fs_exists":
+				fsExists = c
+			}
+		}
+		// Deliver the second call first to prove the existing out-of-order
+		// ledger still works through the facade.
+		res, err = fsGatherInst.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": fsExists.ID, "ok": true, "value": map[string]any{"exists": true}},
+		}, false))
+		fsGatherOK = fsGatherOK && err == nil && res.Type == "suspended" &&
+			len(res.Calls) == 0 && len(res.Awaiting) == 1 && res.Awaiting[0] == fsRead.ID
+		res, err = fsGatherInst.invokeJSON(ctx, toolResponses([]map[string]any{
+			{"id": fsRead.ID, "ok": true, "value": map[string]any{"text": "A"}},
+		}, false))
+	}
+	check("fs facade gather supports out-of-order delivery",
+		fsGatherOK && err == nil && res.Type == "completed" && res.Output == "A True\n",
+		fmt.Sprintf("err=%v %s", err, describe(res)))
+
 	// Close the last scenario's module explicitly so the ownership check below
 	// sees a balanced count.  The defer in main is a safety net for early exits.
 	if currentInstance != nil {
