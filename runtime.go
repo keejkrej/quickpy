@@ -70,6 +70,12 @@ func validateRuntimeOptions(opts RuntimeOptions) (RuntimeOptions, error) {
 	if opts.Artifact.Path != "" && len(opts.Artifact.Bytes) > 0 {
 		return opts, invalidRequest("new", "artifact must be either a path or bytes, not both")
 	}
+	if len(opts.Artifact.Bytes) > 0 {
+		// Take ownership of the artifact bytes so a caller that reuses or
+		// mutates its slice after New cannot race the compiled runtime or
+		// change what was compiled.
+		opts.Artifact.Bytes = append([]byte(nil), opts.Artifact.Bytes...)
+	}
 	if opts.MaxMemoryBytes <= 0 {
 		return opts, invalidRequest("new", "MaxMemoryBytes must be > 0")
 	}

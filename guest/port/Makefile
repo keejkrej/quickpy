@@ -48,10 +48,12 @@ SRC_C = \
 	adapter.c \
 	setjmp_rt.c \
 	extmod/modasyncio.c \
+	extmod/modbinascii.c \
 	extmod/modjson.c \
+	extmod/modre.c \
 	extmod/modtime.c
 
-SRC_QSTR += adapter.c extmod/modasyncio.c extmod/modjson.c extmod/modtime.c
+SRC_QSTR += adapter.c extmod/modasyncio.c extmod/modbinascii.c extmod/modjson.c extmod/modre.c extmod/modtime.c
 
 OBJ += $(PY_O)
 OBJ += $(addprefix $(BUILD)/, $(SRC_C:.c=.o))

@@ -13,6 +13,10 @@ type Value any
 
 // ArtifactSource identifies the compiled guest artifact. Set exactly one of
 // Path or Bytes.
+//
+// Bytes is copied by New, so the caller may reuse or mutate the slice after New
+// returns. The bytes are compiled directly from memory; no temporary file is
+// created and no writable TMPDIR is required.
 type ArtifactSource struct {
 	Path  string
 	Bytes []byte

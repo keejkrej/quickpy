@@ -31,8 +31,15 @@ const (
 
 // Options configures the spike host. All limits are per instance except where
 // noted. The artifact is compiled once and instantiated fresh per execution.
+//
+// Set exactly one of ArtifactPath or ArtifactBytes. ArtifactPath is for CLI and
+// local-development callers that already have a file. ArtifactBytes is
+// compiled directly from memory and never touches the filesystem or a
+// temporary directory. NewRuntime does not retain or mutate ArtifactBytes; the
+// caller must not mutate the slice concurrently with NewRuntime.
 type Options struct {
 	ArtifactPath    string
+	ArtifactBytes   []byte
 	MaxMemoryBytes  int64
 	MaxMessageBytes int
 	MaxOutputBytes  int
@@ -167,11 +174,18 @@ type Runtime struct {
 	nextInst atomic.Uint64
 }
 
-// NewRuntime reads and compiles the artifact once, installs the WASI prelude,
-// and rejects imports outside the spike's capability allowlist.
+// NewRuntime compiles the artifact once, installs the WASI prelude, and rejects
+// imports outside the spike's capability allowlist. The artifact comes from
+// exactly one of Options.ArtifactPath or Options.ArtifactBytes; the bytes form
+// is compiled directly and never creates a temporary file.
 func NewRuntime(ctx context.Context, opts Options) (*Runtime, error) {
-	if opts.ArtifactPath == "" {
-		return nil, newError(KindInvalidRequest, "", "new", "", "artifact path is required", nil)
+	switch {
+	case opts.ArtifactPath != "" && len(opts.ArtifactBytes) > 0:
+		return nil, newError(KindInvalidRequest, "", "new", "", "artifact must be either a path or bytes, not both", nil)
+	case opts.ArtifactPath == "" && opts.ArtifactBytes == nil:
+		return nil, newError(KindInvalidRequest, "", "new", "", "artifact path or bytes is required", nil)
+	case opts.ArtifactPath == "" && len(opts.ArtifactBytes) == 0:
+		return nil, newError(KindInvalidRequest, "", "new", "", "artifact bytes are empty", nil)
 	}
 	if opts.MaxMemoryBytes <= 0 {
 		return nil, newError(KindInvalidRequest, "", "new", "", "max memory bytes must be > 0", nil)
@@ -186,9 +200,13 @@ func NewRuntime(ctx context.Context, opts Options) (*Runtime, error) {
 		return nil, newError(KindInvalidRequest, "", "new", "", "default timeout must be >= 0", nil)
 	}
 
-	wasmBytes, err := os.ReadFile(opts.ArtifactPath)
-	if err != nil {
-		return nil, newError(KindInvalidRequest, "", "new", "", "read artifact: "+err.Error(), err)
+	wasmBytes := opts.ArtifactBytes
+	if opts.ArtifactPath != "" {
+		var err error
+		wasmBytes, err = os.ReadFile(opts.ArtifactPath)
+		if err != nil {
+			return nil, newError(KindInvalidRequest, "", "new", "", "read artifact: "+err.Error(), err)
+		}
 	}
 
 	pages := uint32((opts.MaxMemoryBytes + 65535) / 65536)
