@@ -397,8 +397,12 @@ constraints and post-M2 work, not open conformance gates.
   [`guest/M1_NOTES.md`](guest/M1_NOTES.md) and
   [`integration/SOAK.md`](integration/SOAK.md) for current evidence.
 
-## License status
+## License
 
-No project license has been chosen yet. Original QuickPy code is therefore not
-licensed by this repository's third-party notices. Third-party components and
-their notices are recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Original QuickPy code is licensed under the MIT License; see
+[`LICENSE`](LICENSE) at the repository root. Copyright (c) 2026 keejkrej and
+contributors.
+
+Third-party components keep their own upstream licenses and are not relicensed
+by the root `LICENSE`. Their provenance and required notices are recorded in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
