@@ -373,9 +373,11 @@ included.
 
 ## 10. Third-party and licensing status
 
-No project license has been chosen. Original QuickPy code is not licensed by
-the third-party notices file. Third-party components, provenance, and required
-notices are recorded in [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
+Original QuickPy code is licensed under the MIT License; see
+[`../LICENSE`](../LICENSE) at the repository root. Third-party components keep
+their own upstream licenses and are not relicensed by the root `LICENSE`.
+Provenance and required notices are recorded in
+[`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
 
 Key points:
 

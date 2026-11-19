@@ -1,11 +1,13 @@
 # Third-party notices
 
 QuickPy includes, adapts, or depends on the third-party components listed
-below. This file records provenance and required notices. It does **not**
-license original QuickPy code: no project license has been chosen yet.
+below. This file records provenance and required notices for those third-party
+components only.
 
-Nothing here should be read as a license grant for the QuickPy repository as a
-whole.
+Original QuickPy code is licensed under the MIT License; see
+[`LICENSE`](LICENSE) at the repository root. Nothing in this file relicenses
+third-party components, and nothing here should be read as changing the
+upstream license of any component listed below.
 
 ---
 
@@ -594,6 +596,6 @@ themselves.
 
 ## 6. Open licensing items
 
-- No project license has been chosen for original QuickPy code.
+- Original QuickPy code is MIT licensed under the root [`LICENSE`](LICENSE).
 - If a release is prepared, re-check the pinned MicroPython and wasi-libc
   revisions and confirm all notices are complete.
